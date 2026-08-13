@@ -42,6 +42,32 @@ except ImportError:
 IS_WIN = os.name == "nt"
 
 
+def enumerate_ports(include_all=False):
+    """
+    List serial ports worth scanning.
+
+    On Windows: every detected COM port.
+    On Linux/macOS: real ports only -- USB adapters (ttyUSB*/ttyACM*, macOS
+    cu.*/tty.*) plus any legacy port backed by real hardware (a
+    /sys/class/tty/<name>/device link). This drops the ~190 phantom /dev/ttyS*
+    stubs that Linux/WSL register but that have no device behind them. Pass
+    include_all=True to scan everything regardless.
+    """
+    infos = list_ports.comports()
+    devices = [p.device for p in infos]
+    if IS_WIN or include_all:
+        return devices
+
+    real = []
+    for dev in devices:
+        name = os.path.basename(dev)
+        if name.startswith(("ttyUSB", "ttyACM")) or name.startswith(("cu.", "tty.")):
+            real.append(dev)
+        elif os.path.exists(f"/sys/class/tty/{name}/device"):
+            real.append(dev)
+    return real
+
+
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
@@ -732,6 +758,8 @@ def main():
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("--no-resize", action="store_true",
                     help="do not shrink the console window on start")
+    ap.add_argument("--all", action="store_true",
+                    help="scan every port incl. phantom /dev/ttyS* (Linux)")
     args = ap.parse_args()
 
     if not args.no_resize:
@@ -740,10 +768,16 @@ def main():
     if args.ports:
         ports = args.ports
     else:
-        ports = [p.device for p in list_ports.comports()]
+        ports = enumerate_ports(include_all=args.all)
 
     if not ports:
-        print("No serial ports found.")
+        if not IS_WIN and not args.all:
+            print("No real serial ports found. USB adapters show as "
+                  "/dev/ttyUSB* or /dev/ttyACM*.\n"
+                  "  - In WSL, attach the USB device first: usbipd attach --wsl --busid <id>\n"
+                  "  - To scan the phantom /dev/ttyS* stubs anyway, re-run with --all")
+        else:
+            print("No serial ports found.")
         return
 
     workers = max(1, min(args.workers, len(ports)))
