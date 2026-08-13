@@ -194,6 +194,23 @@ The compact window size lives in `scripts/launch.vbs` (`cols`/`rows`).
 To rebuild the exe on a fresh machine: install Python (tick "Add to PATH"),
 clone this repo, run `build.bat`.
 
+## Releases / CI
+
+A GitHub Actions workflow ([.github/workflows/release.yml](.github/workflows/release.yml))
+builds on every push and, when you push a version tag, attaches the artifacts to
+a GitHub Release:
+
+- `uart_scan-windows-x64.exe` — standalone Windows binary
+- `UART-Scanner-Setup.exe` — Windows installer
+- `uart_scan-linux-x64` — standalone Linux binary
+
+Cut a release:
+
+```sh
+git tag v1.0.0
+git push origin v1.0.0
+```
+
 ## How it works (notes)
 
 - **Marker-framed commands.** Each command is sent as

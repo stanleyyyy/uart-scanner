@@ -1,0 +1,91 @@
+name: Build & Release
+
+# Build artifacts on every push (for verification) and, when a version tag is
+# pushed (e.g. v1.0.0), attach them to a GitHub Release.
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the Release
+
+jobs:
+  # ---------------------------------------------------------------------------
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: python -m pip install --upgrade pyserial pyinstaller
+
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --console --name uart_scan
+          --hidden-import serial.tools.list_ports uart_scan.py
+
+      - name: Build installer (Inno Setup)
+        run: iscc installer\uart-scanner.iss
+        # Inno Setup ships preinstalled on GitHub's windows-latest runners.
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p out
+          cp dist/uart_scan.exe out/uart_scan-windows-x64.exe
+          cp installer/Output/UART-Scanner-Setup.exe out/UART-Scanner-Setup.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  # ---------------------------------------------------------------------------
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: python -m pip install --upgrade pyserial pyinstaller
+
+      - name: Build binary
+        run: >
+          pyinstaller --onefile --console --name uart_scan
+          --hidden-import serial.tools.list_ports uart_scan.py
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p out
+          cp dist/uart_scan out/uart_scan-linux-x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*
+
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [windows, linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
