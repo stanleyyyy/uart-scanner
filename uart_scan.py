@@ -39,6 +39,8 @@ try:
 except ImportError:
     sys.exit("pyserial not installed.  Run:  pip install pyserial")
 
+IS_WIN = os.name == "nt"
+
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -338,7 +340,8 @@ def scan_parallel(ports, baud, verbose, budget, max_workers):
     blocked serial call can be forcibly terminated (which also releases the
     port) instead of hanging the whole scan.
     """
-    ctx = mp.get_context("spawn")           # Windows-safe
+    # spawn on Windows (no fork); fork on Unix (faster, no re-import needed).
+    ctx = mp.get_context("spawn" if IS_WIN else "fork")
     remaining = list(ports)
     active = []                             # list of job dicts
     results = []
@@ -470,6 +473,66 @@ def launch_teraterm(port, baud, exe):
         return f"! failed to launch TeraTerm: {e}"
 
 
+# Serial console tools (preferred first) -> argv builder for `<tool> port baud`.
+_SERIAL_TOOLS = [
+    ("tio",     lambda p, b: ["tio", "-b", str(b), p]),
+    ("picocom", lambda p, b: ["picocom", "-b", str(b), p]),
+    ("minicom", lambda p, b: ["minicom", "-b", str(b), "-D", p]),
+    ("screen",  lambda p, b: ["screen", p, str(b)]),
+    ("cu",      lambda p, b: ["cu", "-l", p, "-s", str(b)]),
+]
+
+# Terminal emulators (preferred first) -> flag that precedes the command argv.
+_TERMINALS = [
+    ("x-terminal-emulator", "-e"),
+    ("gnome-terminal", "--"),
+    ("konsole", "-e"),
+    ("xfce4-terminal", "-x"),
+    ("mate-terminal", "-x"),
+    ("alacritty", "-e"),
+    ("kitty", None),          # kitty <cmd...>
+    ("xterm", "-e"),
+]
+
+
+def launch_serial_terminal(port, baud):
+    """
+    Open `port` in a serial console on Linux/macOS. Prefers tio/picocom/minicom/
+    screen/cu, hosted in a GUI terminal if a display is available; otherwise
+    returns the command to run by hand. Returns a status message string.
+    """
+    tool = next(((n, b) for n, b in _SERIAL_TOOLS if shutil.which(n)), None)
+    if not tool:
+        return ("! no serial tool found -- install one of: "
+                "tio, picocom, minicom, screen, cu")
+    name, build = tool
+    scmd = build(port, baud)
+
+    have_display = bool(os.environ.get("DISPLAY") or
+                        os.environ.get("WAYLAND_DISPLAY"))
+    if have_display:
+        term = next(((n, f) for n, f in _TERMINALS if shutil.which(n)), None)
+        if term:
+            tname, flag = term
+            argv = [tname] + ([flag] if flag else []) + scmd
+            try:
+                subprocess.Popen(argv, close_fds=True,
+                                 start_new_session=True)
+                return f"launched {tname} -> {name} on {port} @ {baud}"
+            except Exception as e:
+                return f"! failed to launch {tname}: {e}"
+
+    # Headless / SSH / no terminal emulator: hand back the command.
+    return "run:  " + " ".join(scmd)
+
+
+def open_port(port, baud, exe):
+    """Open a responding port in the platform's serial console."""
+    if IS_WIN:
+        return launch_teraterm(port, baud, exe)
+    return launch_serial_terminal(port, baud)
+
+
 def set_console_size(cols=100, lines=40):
     """Shrink the console window (Windows only, real console only)."""
     if os.name != "nt" or not sys.stdout.isatty():
@@ -508,8 +571,7 @@ def enable_vt():
         return False
 
 
-def _getch():
-    """Read one keypress on Windows, returning a normalized token."""
+def _getch_win():
     import msvcrt
     ch = msvcrt.getch()
     if ch in (b"\x00", b"\xe0"):          # arrow / function key prefix
@@ -525,8 +587,41 @@ def _getch():
         return "other"
 
 
+def _getch_unix():
+    import termios
+    import tty
+    import select
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x1b":
+            # Could be a bare Esc or an arrow (ESC [ A/B). Peek without blocking.
+            if select.select([sys.stdin], [], [], 0.005)[0]:
+                seq = sys.stdin.read(1)
+                if seq == "[" and select.select([sys.stdin], [], [], 0.005)[0]:
+                    code = sys.stdin.read(1)
+                    return {"A": "up", "B": "down"}.get(code, "other")
+            return "esc"
+        return ch.lower()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _getch():
+    """Read one keypress and return a normalized token (up/down/enter/esc/char)."""
+    return _getch_win() if IS_WIN else _getch_unix()
+
+
+# What the "open" action is called on this platform.
+OPENER = "TeraTerm" if IS_WIN else "a serial console"
+
+
 def _menu_label(r):
-    return f"{r['port']:<7} {r['status']:<24} {r['type'][:34]}"
+    return f"{r['port']:<12} {r['status']:<24} {r['type'][:32]}"
 
 
 def _menu_numbered(choices, baud, exe):
@@ -536,13 +631,13 @@ def _menu_numbered(choices, baud, exe):
         for i, r in enumerate(choices, 1):
             print(f"  {i}. {_menu_label(r)}")
         try:
-            raw = input("Open which in TeraTerm? (number, or q to quit): ").strip()
+            raw = input(f"Open which in {OPENER}? (number, or q to quit): ").strip()
         except EOFError:
             return
         if raw.lower() in ("q", "quit", "", "exit"):
             return
         if raw.isdigit() and 1 <= int(raw) <= len(choices):
-            print("  " + launch_teraterm(choices[int(raw) - 1]["port"], baud, exe))
+            print("  " + open_port(choices[int(raw) - 1]["port"], baud, exe))
         else:
             print("  ? enter a listed number, or q to quit")
 
@@ -557,7 +652,7 @@ def _menu_arrows(choices, baud, exe):
     """
     sel = 0
     status = "\u2191/\u2193 move \u00b7 Enter open \u00b7 Esc/q quit"
-    header = "Select a port to open in TeraTerm:"
+    header = f"Select a port to open in {OPENER}:"
     block = len(choices) + 3          # header + rows + blank + status
     first = True
 
@@ -584,7 +679,7 @@ def _menu_arrows(choices, baud, exe):
         elif key == "down":
             sel = (sel + 1) % len(choices)
         elif key == "enter":
-            status = launch_teraterm(choices[sel]["port"], baud, exe)
+            status = open_port(choices[sel]["port"], baud, exe)
         elif key in ("esc", "q"):
             sys.stdout.write("\n")
             return
@@ -601,12 +696,15 @@ def interactive_menu(results, baud, exe):
         return
 
     have_keys = False
-    if os.name == "nt":
-        try:
+    try:
+        if IS_WIN:
             import msvcrt  # noqa: F401
-            have_keys = True
-        except ImportError:
-            have_keys = False
+        else:
+            import termios  # noqa: F401
+            import tty      # noqa: F401
+        have_keys = True
+    except ImportError:
+        have_keys = False
 
     # Use the fancy arrow menu only when both keypress input AND VT rendering
     # are available; otherwise fall back to a robust numbered prompt.
@@ -677,11 +775,19 @@ def main():
         print(f"      device: {r['type']}")
         print(f"      ip    : {r['ip']}")
 
-    # Resolve TeraTerm: explicit flag > auto-detect > legacy default.
-    teraterm = args.teraterm or find_teraterm() or DEFAULT_TERATERM
+    # Resolve the "opener": TeraTerm on Windows, a serial tool on Unix.
+    if IS_WIN:
+        teraterm = args.teraterm or find_teraterm() or DEFAULT_TERATERM
+        opener_note = (f"TeraTerm: {teraterm}"
+                       f"{'' if os.path.isfile(teraterm) else '   (NOT FOUND)'}")
+    else:
+        teraterm = ""
+        tool = next((n for n, _ in _SERIAL_TOOLS if shutil.which(n)), None)
+        opener_note = (f"Serial console: {tool}" if tool else
+                       "Serial console: none found (install tio/picocom/minicom/screen)")
+
     if not args.no_menu:
-        print(f"\nTeraTerm: {teraterm}"
-              f"{'' if os.path.isfile(teraterm) else '   (NOT FOUND)'}")
+        print("\n" + opener_note)
         interactive_menu(results, args.baud, teraterm)
 
 

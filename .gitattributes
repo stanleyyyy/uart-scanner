@@ -1,0 +1,14 @@
+# Normalize line endings so scripts work on their target OS regardless of
+# where they were edited.
+
+# Unix scripts + Python must be LF (a CRLF in a shebang breaks execution).
+*.sh   text eol=lf
+*.py   text eol=lf
+
+# Windows scripts must be CRLF.
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+*.vbs  text eol=crlf
+
+# Let Git decide for docs.
+*.md   text

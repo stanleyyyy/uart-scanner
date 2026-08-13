@@ -44,15 +44,46 @@ are probed **in parallel**.
 > devices. A stray `root` + Enter goes to every responding port, so if a port is
 > mid-protocol you care about, pass explicit port names instead of scanning all.
 
+Runs on **Windows** and **Linux/macOS** — the scan engine is the same; only the
+console handling and the "open port" tool differ per platform.
+
 ## Requirements
 
+**Windows**
 - Windows 10/11
-- Python 3.8+ with **pyserial** (only if running from source — the prebuilt
-  `.exe` bundles everything)
-- [TeraTerm](https://teratermproject.github.io/) (optional, for the "open port"
-  feature) — auto-detected from PATH, the registry, and common install dirs
+- Python 3.8+ with **pyserial** (only from source — the prebuilt `.exe` bundles
+  everything)
+- [TeraTerm](https://teratermproject.github.io/) (optional, for "open port") —
+  auto-detected from PATH, the registry, and common install dirs
+
+**Linux / macOS**
+- Python 3.8+ with **pyserial**
+- A serial console tool for "open port": one of **tio**, **picocom**,
+  **minicom**, **screen**, **cu** (auto-detected)
+- Read access to `/dev/tty*` — on Linux add yourself to the `dialout` group:
+  `sudo usermod -aG dialout "$USER"` (then log out/in)
 
 ## Install / setup
+
+### Linux / macOS
+
+```sh
+./install.sh
+```
+
+Installs `pyserial`, drops `uart_scan.py` into `~/.local/bin/uart-scan`, and
+(on Linux) adds a `.desktop` launcher. Then run:
+
+```sh
+uart-scan
+```
+
+Or just run the script directly without installing: `python3 uart_scan.py`.
+The arrow-key menu works the same (via `termios`); selecting a port opens it in
+your serial tool — in a GUI terminal if `$DISPLAY` is set, otherwise it prints
+the exact `tio`/`picocom`/… command to run.
+
+### Windows
 
 ### Option A — run from source
 
