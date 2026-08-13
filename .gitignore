@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Local editor / OS cruft
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
