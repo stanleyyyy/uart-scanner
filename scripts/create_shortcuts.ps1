@@ -10,12 +10,17 @@
 $ErrorActionPreference = 'Stop'
 
 # Repo root = parent of this script's folder.
-$root = Split-Path -Parent $PSScriptRoot
-$bat  = Join-Path $root 'uart_scan.bat'
+$root    = Split-Path -Parent $PSScriptRoot
+$vbs     = Join-Path $root 'scripts\launch.vbs'
+$wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+$exe     = Join-Path $root 'dist\uart_scan.exe'
 
-if (-not (Test-Path $bat)) {
-    throw "uart_scan.bat not found next to the repo root ($bat)"
+if (-not (Test-Path $vbs)) {
+    throw "launch.vbs not found ($vbs)"
 }
+
+# Use the built exe as the icon if present, else the generic console icon.
+$icon = if (Test-Path $exe) { "$exe,0" } else { "$env:SystemRoot\System32\cmd.exe,0" }
 
 $ws = New-Object -ComObject WScript.Shell
 $targets = @(
@@ -26,9 +31,12 @@ $targets = @(
 foreach ($dir in $targets) {
     $lnkPath = Join-Path $dir 'UART Scanner.lnk'
     $lnk = $ws.CreateShortcut($lnkPath)
-    $lnk.TargetPath       = $bat
+    # wscript runs launch.vbs with no console of its own -> the only window that
+    # appears is the pre-sized "UART Scanner" console (no resize flash).
+    $lnk.TargetPath       = $wscript
+    $lnk.Arguments        = '"' + $vbs + '"'
     $lnk.WorkingDirectory = $root
-    $lnk.IconLocation     = "$env:SystemRoot\System32\cmd.exe,0"
+    $lnk.IconLocation     = $icon
     $lnk.Description       = 'Scan all UART/COM ports for a shell'
     $lnk.WindowStyle       = 1
     $lnk.Save()

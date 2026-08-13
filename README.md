@@ -61,10 +61,13 @@ install.bat
 ```
 
 This installs `pyserial` and creates **Desktop + Start Menu** shortcuts
-("UART Scanner"). Then launch from the shortcut or:
+("UART Scanner"). The shortcuts launch through `scripts\launch.vbs`, which opens
+the console **already sized** (no resize flash). Then launch from the shortcut,
+or run either of:
 
 ```bat
-uart_scan.bat
+scripts\launch.vbs      rem flash-free, pre-sized window (same as the shortcut)
+uart_scan.bat           rem simple direct launcher (brief resize on open)
 ```
 
 ### Option B — standalone .exe (no Python on the target)
@@ -133,11 +136,15 @@ On consoles without ANSI support it falls back to a numbered prompt
 Everything needed to rebuild lives in this repo:
 
 - `uart_scan.py` — the whole app (single file)
-- `uart_scan.bat` — clickable launcher (sets a compact window)
+- `scripts/launch.vbs` — flash-free launcher (pre-sizes the console window)
+- `run_app.bat` — inner runner used by launch.vbs (exe first, then script)
+- `uart_scan.bat` — simple direct launcher (fallback)
 - `install.bat` — installs deps + creates shortcuts
 - `build.bat` — builds the standalone `.exe`
 - `scripts/create_shortcuts.ps1` — shortcut creation (called by install.bat)
 - `requirements.txt` — `pyserial`
+
+The compact window size lives in `scripts/launch.vbs` (`cols`/`rows`).
 
 To rebuild the exe on a fresh machine: install Python (tick "Add to PATH"),
 clone this repo, run `build.bat`.
