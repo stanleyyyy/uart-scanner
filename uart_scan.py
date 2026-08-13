@@ -758,12 +758,12 @@ def main():
     print("\n" + "=" * W)
     print("SUMMARY")
     print("=" * W)
-    fmt = "{:<7} {:<24} {:<40} {:<22}"
+    fmt = "{:<13} {:<22} {:<38} {:<20}"
     print(fmt.format("PORT", "STATUS", "TYPE / DEVICE", "IP (iface:addr)"))
     print("-" * W)
     for r in results:
         typ = r["type"] if r["type"] != "-" else (r["note"] or "-")
-        print(fmt.format(r["port"], r["status"][:24], typ[:40], r["ip"][:22]))
+        print(fmt.format(r["port"][:13], r["status"][:22], typ[:38], r["ip"][:20]))
     print("=" * W)
 
     accessible = [r for r in results if r["status"].startswith("accessible")]
