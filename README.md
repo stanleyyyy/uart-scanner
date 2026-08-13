@@ -81,6 +81,20 @@ build.bat
 Copy the resulting `dist\uart_scan.exe` anywhere and run it — nothing else
 required.
 
+### Option C — shareable installer (best for handing to others)
+
+Build a single `Setup.exe` that bundles the standalone app and creates the
+shortcuts on the target machine:
+
+```bat
+installer\build_installer.bat
+```
+
+Output: `installer\Output\UART-Scanner-Setup.exe`. Share that one file. It
+installs per-user (no admin prompt), needs **no Python**, and adds a Start Menu
+(and optional Desktop) shortcut that launches the flash-free window. Uninstall
+via *Settings → Apps* like any program.
+
 ## Usage
 
 ```

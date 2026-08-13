@@ -5,6 +5,9 @@ dist/
 __pycache__/
 *.pyc
 
+# Installer output
+installer/Output/
+
 # Local editor / OS cruft
 .vscode/
 .idea/
