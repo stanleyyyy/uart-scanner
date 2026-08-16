@@ -43,24 +43,44 @@ IS_WIN = os.name == "nt"
 
 
 # ---------------------------------------------------------------------------
-# ANSI color (Linux natively; Windows once VT processing is enabled)
+# ANSI color + glyphs (Linux natively; Windows once VT processing is enabled).
+# Muted standard palette -- readable on a dark console, not neon.
 # ---------------------------------------------------------------------------
 FG_RED, FG_GREEN, FG_YELLOW, FG_BLUE = 31, 32, 33, 34
 FG_MAGENTA, FG_CYAN, FG_GRAY = 35, 36, 90
-FG_BR_GREEN, FG_BR_BLUE, FG_BR_MAGENTA, FG_BR_CYAN = 92, 94, 95, 96
 BOLD, DIM = 1, 2
 USE_COLOR = False
+USE_UNICODE = False
+
+# Device-field colors (one per kind, muted).
+COL_MODEL  = (FG_MAGENTA,)
+COL_SYSTEM = (FG_YELLOW,)
+COL_HOST   = (FG_CYAN,)
+COL_IP     = (FG_GREEN,)
+
+# Status "kind" -> color and glyph. A color-coded filled dot (●) reads clearly
+# and is present in virtually every monospace font; ASCII fallback for pipes.
+_KIND_STYLE = {"ok": (FG_GREEN,), "fail": (FG_RED,), "part": (FG_YELLOW,)}
+_KIND_GLYPH = {"ok": ("●", "+"), "fail": ("●", "x"), "part": ("●", "*")}
 
 
 def setup_color():
-    """Enable colored output when the terminal supports it (and NO_COLOR unset)."""
-    global USE_COLOR
-    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    """Enable colored/unicode output when the terminal supports it (NO_COLOR aware).
+
+    We do NOT reconfigure stdout: on Windows, Python writes to an interactive
+    console via the Unicode API (WriteConsoleW), so box-drawing and ● render
+    regardless of the console code page. Unicode is only used when stdout is a
+    real terminal; piped output stays ASCII so no encoding error can occur.
+    """
+    global USE_COLOR, USE_UNICODE
+    tty = sys.stdout.isatty()
+    if not tty or os.environ.get("NO_COLOR"):
         USE_COLOR = False
     elif IS_WIN:
-        USE_COLOR = enable_vt()          # defined below; called at runtime
+        USE_COLOR = enable_vt()              # defined below; called at runtime
     else:
         USE_COLOR = True
+    USE_UNICODE = tty
     return USE_COLOR
 
 
@@ -71,29 +91,33 @@ def paint(text, *codes):
     return "\x1b[" + ";".join(str(c) for c in codes) + "m" + text + "\x1b[0m"
 
 
-def status_style(status):
-    """SGR codes for a port status (green=shell, red=failed/unresponsive, yellow=partial)."""
+def status_kind(status):
     s = status.lower()
     if s.startswith("accessible"):
-        return (FG_GREEN, BOLD)
-    if "timeout" in s:
-        return (FG_RED, BOLD)
-    if s.startswith("inaccessible"):
-        return (FG_RED,)
-    if s.startswith("silent"):
-        return (FG_RED, DIM)       # unresponsive -> red (dim)
-    if "login required" in s:
-        return (FG_YELLOW, BOLD)
-    if s.startswith("responded"):
-        return (FG_YELLOW,)
-    return (FG_RED, DIM)
+        return "ok"
+    if s.startswith(("timeout", "inaccessible", "silent")):
+        return "fail"
+    return "part"                            # login required / responded
 
 
-# Per-field colors for device details (chosen to read well on a dark console).
-COL_MODEL  = (FG_BR_MAGENTA, BOLD)
-COL_SYSTEM = (FG_BR_CYAN,)
-COL_HOST   = (FG_BR_BLUE, BOLD)
-COL_IP     = (FG_BR_GREEN,)
+def status_style(status):
+    return _KIND_STYLE[status_kind(status)]
+
+
+def status_glyph(status):
+    """A colored ✓/✗/• (ASCII +/x/* when the console can't do Unicode)."""
+    kind = status_kind(status)
+    uni, asc = _KIND_GLYPH[kind]
+    return paint(uni if USE_UNICODE else asc, *_KIND_STYLE[kind])
+
+
+def rule(width, heavy=False):
+    """A horizontal rule using box-drawing (─/═) or ASCII (-/=)."""
+    if USE_UNICODE:
+        ch = "═" if heavy else "─"
+    else:
+        ch = "=" if heavy else "-"
+    return ch * width
 
 
 def _detail_fields(r):
@@ -444,7 +468,7 @@ def scan_parallel(ports, baud, verbose, budget, max_workers):
                 results.append(got)
                 job["proc"].join(1)
                 active.remove(job)
-                print(f"    -> {paint(got['port'], BOLD)}: "
+                print(f"    {status_glyph(got['status'])} {paint(got['port'], BOLD)}  "
                       f"{paint(got['status'], *status_style(got['status']))}", flush=True)
             elif time.time() > job["deadline"]:
                 job["proc"].terminate()         # hard kill, frees the port
@@ -452,7 +476,7 @@ def scan_parallel(ports, baud, verbose, budget, max_workers):
                 res = _timeout_result(job["port"], budget)
                 results.append(res)
                 active.remove(job)
-                print(f"    -> {paint(res['port'], BOLD)}: "
+                print(f"    {status_glyph(res['status'])} {paint(res['port'], BOLD)}  "
                       f"{paint(res['status'], *status_style(res['status']))}", flush=True)
 
     # Preserve original port order in the summary.
@@ -803,22 +827,28 @@ def _menu_arrows(choices, baud, exe):
 
         print(paint(header[:width], BOLD))
         for i, r in enumerate(choices):
-            typ_w = max(6, width - 42)
-            port = f"{r['port']:<12}"[:12]
-            stat = f"{r['status']:<24}"[:24]
-            typ = f"{r['type'][:typ_w]:<{typ_w}}"
+            info = r.get("info") or {}
+            dev = info.get("model") or info.get("uname") or ""
+            devcodes = COL_MODEL if info.get("model") else COL_SYSTEM
+            dev_w = max(6, width - 38)
+            port = f"{r['port']:<10}"[:10]
+            stat = f"{r['status']:<22}"[:22]
+            dv = f"{dev[:dev_w]:<{dev_w}}"
+            kind = status_kind(r["status"])
+            gch = (_KIND_GLYPH[kind][0] if USE_UNICODE else _KIND_GLYPH[kind][1])
             if i == sel:
                 # reverse-video highlight (no inner color: a reset would end it)
-                print(f" > \x1b[7m{port} {stat} {typ}\x1b[0m")
+                print(f" \x1b[7m{gch} {port} {stat} {dv}\x1b[0m")
             else:
-                print("   " + paint(port, BOLD) + " "
+                print(" " + paint(gch, *_KIND_STYLE[kind]) + " "
+                      + paint(port, BOLD) + " "
                       + paint(stat, *status_style(r["status"])) + " "
-                      + paint(typ, FG_CYAN))
+                      + (paint(dv, *devcodes) if dev else dv))
         print("")
-        print(("  " + "-" * (width - 4))[:width])   # separator rule
+        print(("  " + rule(max(1, width - 4)))[:width])   # separator rule
         for dl in _detail_block(choices[sel], width):
             print(dl)
-        print(status[:width])
+        print(paint(status[:width], DIM))
 
         key = _getch()
         if key == "up":
@@ -911,32 +941,34 @@ def main():
 
     # ---- summary ----  (kept ~96 cols wide so a small console doesn't wrap)
     W = 96
-    print("\n" + "=" * W)
-    print(paint("SUMMARY", BOLD))
-    print("=" * W)
-    print(paint(f"{'PORT':<13} {'STATUS':<22} {'TYPE / DEVICE':<38} "
-                f"{'IP (iface:addr)':<20}", BOLD))
-    print("-" * W)
+    print("\n" + rule(W, heavy=True))
+    print(paint("  SUMMARY", BOLD))
+    print(rule(W, heavy=True))
+    print(paint(f"    {'PORT':<8} {'STATUS':<22} {'DEVICE':<32} "
+                f"{'IP (iface:addr)':<18}", BOLD))
+    print(rule(W))
     for r in results:
-        typ = r["type"] if r["type"] != "-" else (r["note"] or "-")
+        info = r.get("info") or {}
+        dev = info.get("model") or info.get("uname") or ""
+        devcodes = COL_MODEL if info.get("model") else COL_SYSTEM
         has_ip = r["ip"] not in ("-", "")
-        row = (paint(f"{r['port'][:13]:<13}", BOLD) + " "
+        row = (f"  {status_glyph(r['status'])} "
+               + paint(f"{r['port'][:8]:<8}", BOLD) + " "
                + paint(f"{r['status'][:22]:<22}", *status_style(r["status"])) + " "
-               + paint(f"{typ[:38]:<38}", FG_CYAN) + " "
-               + (paint(f"{r['ip'][:20]:<20}", FG_GREEN) if has_ip
-                  else f"{'-':<20}"))
+               + (paint(f"{dev[:32]:<32}", *devcodes) if dev else f"{'-':<32}") + " "
+               + (paint(f"{r['ip'][:18]:<18}", *COL_IP) if has_ip else f"{'-':<18}"))
         print(row)
-    print("=" * W)
+    print(rule(W, heavy=True))
 
     accessible = [r for r in results if r["status"].startswith("accessible")]
     n = len(accessible)
     tail = paint(f"{n}", FG_GREEN, BOLD) if n else paint("0", FG_RED, BOLD)
-    print(f"\n{tail}/{len(results)} port(s) gave a shell.")
+    print(f"\n  {tail}/{len(results)} port(s) gave a shell.")
 
     # Detail block for anything we got into, one color per field (full, untruncated).
     for r in accessible:
-        print(f"\n  {paint(r['port'], BOLD)}  "
-              f"[{paint(r['status'], *status_style(r['status']))}]")
+        print(f"\n  {status_glyph(r['status'])} {paint(r['port'], BOLD)}  "
+              f"{paint(r['status'], *status_style(r['status']))}")
         for label, val, codes in _detail_fields(r):
             if val:
                 print("      " + paint(f"{label:<6}: ", DIM) + paint(val, *codes))
