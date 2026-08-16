@@ -75,7 +75,7 @@ DEFAULT_BAUD = 115200
 READ_TIMEOUT = 0.4          # per-read timeout (s)
 SETTLE       = 0.4          # wait after writing before reading (s)
 LOGIN_RETRIES = 2           # how many newline pokes to try to raise a prompt
-PORT_TIMEOUT = 5            # hard wall-clock budget per port (s); watchdog aborts
+PORT_TIMEOUT = 8            # hard wall-clock budget per port (s); watchdog aborts
 
 LOGIN_PROMPTS = ("login:", "username:", "user:")
 PASSWORD_PROMPTS = ("password:", "passwd:")
@@ -108,55 +108,110 @@ def send(ser, text, settle=SETTLE):
 
 
 # ---------------------------------------------------------------------------
-# Marker-based command execution (survives kernel-log spam, never throws)
+# Single-round-trip shell probe (fast: one command gets identity + IP)
 # ---------------------------------------------------------------------------
-MARK = "XUSCANX"                                   # unlikely to appear naturally
+MARK = "UZP9Q"                                     # unlikely to appear naturally
 KLOG = re.compile(r"^\[\s*\d+\.\d+\]")             # kernel log line: [  12.345] ...
 
+# One command that: prints a start marker, then labelled identity fields, then
+# the network config, then an end marker. Built via a shell variable so the
+# literal marker strings (MARK+"S"/MARK+"E") never appear in the command we
+# type -- only in the command's *output* -- which makes detection reliable
+# whether or not the console echoes input back.
+_INFO_TMPL = (
+    "_Z={m}; echo ${{_Z}}S; "
+    "echo U $(uname -sm 2>/dev/null); "
+    "echo M $(cat /proc/device-tree/model 2>/dev/null | tr -d '\\000'); "
+    "echo O $(. /etc/os-release 2>/dev/null; echo \"$PRETTY_NAME\"); "
+    "echo H $(hostname 2>/dev/null); "
+    "ifconfig 2>/dev/null || ip -o -4 addr 2>/dev/null; "
+    "echo ${{_Z}}E"
+)
+INFO_CMD = _INFO_TMPL.format(m=MARK)
 
-def raw_exec(ser, cmd, timeout=4.0):
-    """
-    Run `cmd` bracketed by echo markers and return (ok, output_lines).
 
-    We send:  echo MARKs; <cmd>; echo MARKe
-    then read until the end marker appears. Only text between the markers is
-    kept, so an interleaving kernel-log line or a noisy prompt can't corrupt
-    the parse, and `ok` is a reliable "a shell actually ran this" signal.
-    """
-    try:
-        ser.reset_input_buffer()
-        ser.write(f"echo {MARK}s; {cmd}; echo {MARK}e\r\n".encode())
-        ser.flush()
-    except Exception:
-        return False, []
-
-    buf = ""
-    end = time.time() + timeout
-    while time.time() < end:
-        buf += drain(ser, 0.2)
-        if (MARK + "e") in buf and buf.count(MARK) >= 3:
-            break
-
-    ok = (MARK + "s") in buf and (MARK + "e") in buf
-    seg = buf
-    if ok:
-        # take the LAST bracketed region (ignores the echoed command line)
-        seg = buf.rsplit(MARK + "e", 1)[0]
-        seg = seg.rsplit(MARK + "s", 1)[1]
-
-    lines = []
+def _parse_info(seg):
+    """Pull identity + IP out of the marked command output."""
+    info = {"uname": "", "model": "", "os": "", "host": "", "ip": "-"}
+    ips, iface = [], "?"
     for ln in seg.splitlines():
         s = ln.strip()
         if not s or MARK in s or KLOG.match(s):
             continue
-        lines.append(s)
-    return ok, lines
+        if s.startswith("U ") and not info["uname"]:
+            info["uname"] = s[2:].strip()
+            continue
+        if s.startswith("M ") and not info["model"]:
+            v = s[2:].strip().replace("\x00", "")
+            if v and "no such" not in v.lower():
+                info["model"] = v
+            continue
+        if s.startswith("O ") and not info["os"]:
+            v = s[2:].strip().strip('"')
+            if v:
+                info["os"] = v
+            continue
+        if s.startswith("H ") and not info["host"]:
+            info["host"] = s[2:].strip()
+            continue
+        # Network output (ifconfig or `ip -o -4 addr`).
+        toks = s.split()
+        if toks and not ln[:1].isspace() and not s.lower().startswith("inet"):
+            iface = toks[0].rstrip(":")
+        if len(toks) >= 2 and toks[0].rstrip(":").isdigit():   # "2: eth0 ..."
+            iface = toks[1].rstrip(":")
+        m = re.search(r"inet (?:addr:)?(\d{1,3}(?:\.\d{1,3}){3})", s)
+        if m and not m.group(1).startswith("127."):
+            ips.append(f"{iface}:{m.group(1)}")
+    if ips:
+        info["ip"] = ", ".join(dict.fromkeys(ips))
+    return info
 
 
-def shell_alive(ser):
-    """True if a shell responds to a bracketed no-op (markers echo back)."""
-    ok, _ = raw_exec(ser, "true", timeout=3.0)
-    return ok
+def shell_probe(ser, timeout=3.5):
+    """
+    Fire one combined identity command and read until the end marker.
+
+    Returns an info dict if a shell answered (end marker seen), else None.
+    This is a single round-trip, so a responsive console finishes in well
+    under a second instead of the old multi-command sequence.
+    """
+    start, endm = MARK + "S", MARK + "E"
+    try:
+        ser.reset_input_buffer()
+        ser.write((INFO_CMD + "\r\n").encode())
+        ser.flush()
+    except Exception:
+        return None
+
+    buf = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        buf += drain(ser, 0.12)
+        if endm in buf:
+            break
+
+    if endm not in buf:
+        return None                       # no shell (or too slow to answer)
+    seg = buf.split(endm, 1)[0]
+    if start in seg:
+        seg = seg.split(start, 1)[1]
+    return _parse_info(seg)
+
+
+def info_type(info):
+    """Build the short 'TYPE / DEVICE' string from a probe info dict."""
+    bits = []
+    if info["model"]:
+        bits.append("model=" + info["model"])
+    if info["os"]:
+        bits.append(info["os"])
+    if info["uname"] and any(k in info["uname"] for k in ("Linux", "BSD", "GNU")):
+        bits.append(info["uname"])
+    if info["host"]:
+        bits.append("host=" + info["host"])
+    bits = list(dict.fromkeys(b for b in bits if b))
+    return " | ".join(bits) if bits else "unknown shell"
 
 
 # ---------------------------------------------------------------------------
@@ -174,80 +229,6 @@ def is_shell(text):
         return False
     last = stripped.splitlines()[-1].strip()
     return last.endswith(("#", "$")) or last in ("#", "$", ">")
-
-
-# ---------------------------------------------------------------------------
-# Device fingerprinting
-# ---------------------------------------------------------------------------
-def _first(lines, reject=("no such", "not found", "command not found")):
-    for l in lines:
-        low = l.lower()
-        if l and not any(r in low for r in reject):
-            return l.replace("\x00", "").strip()
-    return None
-
-
-def fingerprint(ser):
-    """Ask the shell what it is. Return a short type string."""
-    bits = []
-
-    # Board / SoC model from the device tree (great for embedded Linux boards).
-    ok, lines = raw_exec(ser, "cat /proc/device-tree/model 2>/dev/null")
-    m = _first(lines)
-    if m:
-        bits.append("model=" + m)
-
-    # Distro pretty name.
-    ok, lines = raw_exec(ser, "grep -h PRETTY_NAME /etc/os-release 2>/dev/null")
-    for l in lines:
-        if "PRETTY_NAME" in l and "=" in l:
-            bits.append(l.split("=", 1)[1].strip().strip('"'))
-            break
-
-    # Kernel / arch.
-    ok, lines = raw_exec(ser, "uname -srm")
-    u = _first(lines)
-    if u and ("Linux" in u or "BSD" in u or "GNU" in u):
-        bits.append(u)
-
-    # Hostname (always useful, cheap identifier).
-    ok, lines = raw_exec(ser, "hostname")
-    h = _first(lines)
-    if h:
-        bits.append("host=" + h)
-
-    # De-dup while preserving order.
-    bits = list(dict.fromkeys(b for b in bits if b))
-    return " | ".join(bits) if bits else "unknown shell"
-
-
-def get_ip(ser):
-    """
-    Return interface:ip pairs for non-loopback IPv4 addresses.
-
-    Handles both busybox `ifconfig` (iface on its own line, `inet addr:` on the
-    next) and iproute2 `ip -o -4 addr` (`N: iface  inet 1.2.3.4/24 ...`).
-    """
-    ok, lines = raw_exec(ser, "ifconfig 2>/dev/null || ip -o -4 addr 2>/dev/null")
-    pairs = []
-    iface = "?"
-    for ln in lines:
-        toks = ln.split()
-        # ifconfig: interface name starts a non-indented, non-'inet' line.
-        if toks and not ln[:1].isspace() and not ln.lstrip().lower().startswith("inet"):
-            iface = toks[0].rstrip(":")
-        # iproute2 -o form:  "2: eth0    inet 192.168.1.5/24 ..."
-        if len(toks) >= 2 and toks[0].rstrip(":").isdigit():
-            iface = toks[1].rstrip(":")
-
-        m = re.search(r"inet (?:addr:)?(\d{1,3}(?:\.\d{1,3}){3})", ln)
-        if m:
-            ip = m.group(1)
-            if not ip.startswith("127."):
-                pairs.append(f"{iface}:{ip}")
-
-    pairs = list(dict.fromkeys(pairs))
-    return ", ".join(pairs) if pairs else "-"
 
 
 def _snippet(text, n=60):
@@ -281,38 +262,34 @@ def probe_port(port, baud, verbose=False):
         return result
 
     try:
-        # Collect whatever is already coming out, and poke for a prompt.
-        banner = drain(ser, 0.6)
-        banner += send(ser, "")
-        banner += send(ser, "")
+        # Read anything already coming out, then one CR to raise a prompt.
+        banner = drain(ser, 0.4)
+        banner += send(ser, "", settle=0.3)
 
         login_seen = looks_like(banner, LOGIN_PROMPTS) and not is_shell(banner)
 
         # If a login prompt is showing, log in as root with no password.
         if login_seen:
-            reply = send(ser, "root", settle=1.0)
+            reply = send(ser, "root", settle=0.8)
             banner += reply
             if verbose:
                 print(f"--- {port} after 'root' ---\n{reply!r}\n")
             if looks_like(reply, PASSWORD_PROMPTS):
-                banner += send(ser, "", settle=1.0)   # empty password
-            send(ser, "")                              # settle to a prompt
+                banner += send(ser, "", settle=0.8)   # empty password
 
-        # Definitive shell test (works for: open shell, post-login shell, or a
-        # console that's just spewing kernel logs but still has a live shell).
-        alive = shell_alive(ser)
-        if not alive:
-            send(ser, "")
-            time.sleep(0.4)
-            alive = shell_alive(ser)          # one retry (slow / mid-boot boards)
+        # One combined command: is there a shell, and if so, what/where is it?
+        info = shell_probe(ser, timeout=3.5)
+        if info is None and not login_seen:
+            send(ser, "", settle=0.2)                  # nudge, retry once
+            info = shell_probe(ser, timeout=2.5)
 
         if verbose:
-            print(f"--- {port} banner ---\n{banner!r}\n  shell_alive={alive}\n")
+            print(f"--- {port} banner ---\n{banner!r}\n  shell={info is not None}\n")
 
-        if alive:
+        if info is not None:
             result["status"] = "accessible (root)" if login_seen else "accessible (open shell)"
-            result["type"] = fingerprint(ser)
-            result["ip"] = get_ip(ser)
+            result["type"] = info_type(info)
+            result["ip"] = info["ip"]
             return result
 
         # No shell -- classify what we did see.
