@@ -47,6 +47,7 @@ IS_WIN = os.name == "nt"
 # ---------------------------------------------------------------------------
 FG_RED, FG_GREEN, FG_YELLOW, FG_BLUE = 31, 32, 33, 34
 FG_MAGENTA, FG_CYAN, FG_GRAY = 35, 36, 90
+FG_BR_GREEN, FG_BR_BLUE, FG_BR_MAGENTA, FG_BR_CYAN = 92, 94, 95, 96
 BOLD, DIM = 1, 2
 USE_COLOR = False
 
@@ -71,7 +72,7 @@ def paint(text, *codes):
 
 
 def status_style(status):
-    """SGR codes for a port status (green=shell, red=timeout/fail, yellow=partial)."""
+    """SGR codes for a port status (green=shell, red=failed/unresponsive, yellow=partial)."""
     s = status.lower()
     if s.startswith("accessible"):
         return (FG_GREEN, BOLD)
@@ -79,11 +80,33 @@ def status_style(status):
         return (FG_RED, BOLD)
     if s.startswith("inaccessible"):
         return (FG_RED,)
+    if s.startswith("silent"):
+        return (FG_RED, DIM)       # unresponsive -> red (dim)
     if "login required" in s:
         return (FG_YELLOW, BOLD)
     if s.startswith("responded"):
         return (FG_YELLOW,)
-    return (FG_GRAY,)          # silent / anything else
+    return (FG_RED, DIM)
+
+
+# Per-field colors for device details (chosen to read well on a dark console).
+COL_MODEL  = (FG_BR_MAGENTA, BOLD)
+COL_SYSTEM = (FG_BR_CYAN,)
+COL_HOST   = (FG_BR_BLUE, BOLD)
+COL_IP     = (FG_BR_GREEN,)
+
+
+def _detail_fields(r):
+    """Ordered (label, value, color) tuples describing a port's device."""
+    info = r.get("info") or {}
+    # Distro (often absent on embedded) + kernel on one 'system' line.
+    system = " | ".join(x for x in (info.get("os", ""), info.get("uname", "")) if x)
+    return [
+        ("model",  info.get("model", ""),                 COL_MODEL),
+        ("system", system,                                COL_SYSTEM),
+        ("host",   info.get("host", ""),                  COL_HOST),
+        ("ip",     r.get("ip") or info.get("ip", ""),     COL_IP),
+    ]
 
 
 def enumerate_ports(include_all=False):
@@ -290,6 +313,7 @@ def probe_port(port, baud, verbose=False):
         "type": "-",
         "ip": "-",
         "note": "",
+        "info": None,          # structured {model, os, uname, host, ip} if a shell
     }
 
     try:
@@ -334,6 +358,7 @@ def probe_port(port, baud, verbose=False):
             result["status"] = "accessible (root)" if login_seen else "accessible (open shell)"
             result["type"] = info_type(info)
             result["ip"] = info["ip"]
+            result["info"] = info
             return result
 
         # No shell -- classify what we did see.
@@ -703,19 +728,33 @@ def _wrap(text, prefix, width, max_lines):
     return out
 
 
-# Lines reserved for the highlighted item's detail panel (device wraps to 2).
-_DETAIL_LINES = 3
+# One panel line per device field (model / system / host / ip).
+_DETAIL_LINES = 4
+
+
+def _field_line(label, value, codes, width):
+    """A single 'label: value' detail line: dim label + field-colored value."""
+    value = (value or "").strip()
+    prefix = "  " + f"{label:<6}" + ": "
+    avail = max(6, width - len(prefix))
+    if not value:
+        return paint(prefix, DIM) + paint("-", DIM)
+    return paint(prefix, DIM) + paint(value[:avail], *codes)
 
 
 def _detail_block(r, width):
-    """Fixed-height detail panel for the highlighted port (colored)."""
-    dev = r["type"] if r["type"] not in ("-", "") else (r["note"] or "-")
-    lines = _wrap(dev, "  device: ", width, _DETAIL_LINES - 1)
-    lines = [paint(l, FG_CYAN) if l.strip() else l for l in lines]
-    ip = r.get("ip") or "-"
-    ipline = ("  ip     : " + ip)[:width]
-    lines.append(paint(ipline, FG_GREEN) if ip not in ("-", "") else ipline)
-    return lines
+    """Fixed-height detail panel for the highlighted port, one color per field."""
+    if r.get("info"):
+        lines = [_field_line(lbl, val, codes, width)
+                 for lbl, val, codes in _detail_fields(r)]
+    else:
+        # No shell: show the status and note across the reserved lines.
+        st = r.get("status", "")
+        lines = [paint("  status: ", DIM) + paint(st, *status_style(st))]
+        note = r.get("note", "") or "-"
+        lines += [paint(x, DIM) if x.strip() else x
+                  for x in _wrap(note, "  note  : ", width, _DETAIL_LINES - 1)]
+    return (lines + [""] * _DETAIL_LINES)[:_DETAIL_LINES]
 
 
 def _menu_numbered(choices, baud, exe):
@@ -894,12 +933,13 @@ def main():
     tail = paint(f"{n}", FG_GREEN, BOLD) if n else paint("0", FG_RED, BOLD)
     print(f"\n{tail}/{len(results)} port(s) gave a shell.")
 
-    # Detail block for anything we got into, so long fields aren't truncated.
+    # Detail block for anything we got into, one color per field (full, untruncated).
     for r in accessible:
         print(f"\n  {paint(r['port'], BOLD)}  "
               f"[{paint(r['status'], *status_style(r['status']))}]")
-        print(f"      device: {paint(r['type'], FG_CYAN)}")
-        print(f"      ip    : {paint(r['ip'], FG_GREEN)}")
+        for label, val, codes in _detail_fields(r):
+            if val:
+                print("      " + paint(f"{label:<6}: ", DIM) + paint(val, *codes))
 
     # Resolve the "opener": TeraTerm on Windows, a serial tool on Unix.
     if IS_WIN:
