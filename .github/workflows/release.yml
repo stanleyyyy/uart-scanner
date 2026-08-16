@@ -23,12 +23,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
-        run: python -m pip install --upgrade pyserial pyinstaller
+        run: python -m pip install --upgrade pyserial pyinstaller windows-curses
 
       - name: Build exe
         run: >
           pyinstaller --onefile --console --name uart_scan
-          --hidden-import serial.tools.list_ports uart_scan.py
+          --hidden-import serial.tools.list_ports
+          --hidden-import curses --hidden-import _curses uart_scan.py
 
       - name: Build installer (Inno Setup)
         run: iscc installer\uart-scanner.iss
@@ -62,7 +63,8 @@ jobs:
       - name: Build binary
         run: >
           pyinstaller --onefile --console --name uart_scan
-          --hidden-import serial.tools.list_ports uart_scan.py
+          --hidden-import serial.tools.list_ports
+          --hidden-import curses uart_scan.py
 
       - name: Stage artifacts
         run: |

@@ -430,12 +430,22 @@ def _timeout_result(port, budget):
     }
 
 
-def scan_parallel(ports, baud, verbose, budget, max_workers):
+def scan_parallel(ports, baud, verbose, budget, max_workers,
+                  on_log=None, on_result=None):
     """
     Probe all ports concurrently. Each port runs in its own process so a
     blocked serial call can be forcibly terminated (which also releases the
     port) instead of hanging the whole scan.
+
+    on_log(text) / on_result(dict): optional callbacks for live UIs. When
+    on_log is None, progress is printed to stdout (colored) as before.
     """
+    def log(plain, colored=None):
+        if on_log:
+            on_log(plain)
+        else:
+            print(colored if colored is not None else plain, flush=True)
+
     # spawn on Windows (no fork); fork on Unix (faster, no re-import needed).
     ctx = mp.get_context("spawn" if IS_WIN else "fork")
     remaining = list(ports)
@@ -452,7 +462,8 @@ def scan_parallel(ports, baud, verbose, budget, max_workers):
             p.start()
             active.append({"port": port, "proc": p, "q": q,
                            "deadline": time.time() + budget})
-            print(f"[*] probing {port} (max {budget:g}s) ...", flush=True)
+            log(f"probing {port} (max {budget:g}s) ...",
+                f"[*] probing {port} (max {budget:g}s) ...")
 
         time.sleep(0.15)
 
@@ -464,20 +475,24 @@ def scan_parallel(ports, baud, verbose, budget, max_workers):
             except queuemod.Empty:
                 pass
 
+            done = None
             if got is not None:
-                results.append(got)
                 job["proc"].join(1)
                 active.remove(job)
-                print(f"    {status_glyph(got['status'])} {paint(got['port'], BOLD)}  "
-                      f"{paint(got['status'], *status_style(got['status']))}", flush=True)
+                done = got
             elif time.time() > job["deadline"]:
                 job["proc"].terminate()         # hard kill, frees the port
                 job["proc"].join(2)
-                res = _timeout_result(job["port"], budget)
-                results.append(res)
                 active.remove(job)
-                print(f"    {status_glyph(res['status'])} {paint(res['port'], BOLD)}  "
-                      f"{paint(res['status'], *status_style(res['status']))}", flush=True)
+                done = _timeout_result(job["port"], budget)
+
+            if done is not None:
+                results.append(done)
+                if on_result:
+                    on_result(done)
+                log(f"{done['port']}: {done['status']}",
+                    f"    {status_glyph(done['status'])} {paint(done['port'], BOLD)}  "
+                    f"{paint(done['status'], *status_style(done['status']))}")
 
     # Preserve original port order in the summary.
     order = {p: i for i, p in enumerate(ports)}
@@ -892,6 +907,239 @@ def interactive_menu(results, baud, exe):
 
 
 # ---------------------------------------------------------------------------
+# Full-screen TUI (curses): live log, scrollable, navigable port list
+# ---------------------------------------------------------------------------
+def _tui_put(win, y, x, text, attr=0):
+    """addstr that clips to the window and never raises at the edges."""
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    text = str(text)[:max(0, w - x - 1)]
+    try:
+        win.addstr(y, x, text, attr)
+    except Exception:
+        pass
+
+
+def _blank_row(port):
+    return {"port": port, "status": "scanning...", "type": "-", "ip": "-",
+            "info": None, "note": ""}
+
+
+def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe):
+    import curses
+    import threading
+
+    curses.curs_set(0)
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
+    pair = {}
+    for i, col in enumerate([curses.COLOR_GREEN, curses.COLOR_RED, curses.COLOR_YELLOW,
+                             curses.COLOR_MAGENTA, curses.COLOR_CYAN, curses.COLOR_BLUE,
+                             curses.COLOR_WHITE], start=1):
+        try:
+            curses.init_pair(i, col, -1)
+        except curses.error:
+            pass
+    GREEN, RED, YELLOW = curses.color_pair(1), curses.color_pair(2), curses.color_pair(3)
+    MAGENTA, CYAN = curses.color_pair(4), curses.color_pair(5)
+    B = curses.A_BOLD
+    KIND_ATTR = {"ok": GREEN | B, "fail": RED | B, "part": YELLOW | B}
+    FIELD_ATTR = {"model": MAGENTA | B, "system": YELLOW | B,
+                  "host": CYAN | B, "ip": GREEN | B}
+
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+    stdscr.timeout(120)
+
+    lock = threading.Lock()
+    rows = [_blank_row(p) for p in ports]
+    row_of = {p: i for i, p in enumerate(ports)}
+    logs = []
+    st = {"scanning": False, "sel": 0, "top": 0, "log_off": 0, "msg": ""}
+
+    def add_log(text):
+        with lock:
+            logs.append(text)
+            if len(logs) > 3000:
+                del logs[:len(logs) - 3000]
+
+    def add_result(r):
+        with lock:
+            i = row_of.get(r["port"])
+            if i is not None:
+                rows[i] = r
+
+    def start_scan():
+        if st["scanning"]:
+            return
+        with lock:
+            for i, p in enumerate(ports):
+                rows[i] = _blank_row(p)
+            logs.append("--- scan start (%d ports @ %d baud) ---" % (len(ports), baud))
+        st["scanning"] = True
+
+        def worker():
+            try:
+                scan_parallel(ports, baud, verbose, timeout, workers,
+                              on_log=add_log, on_result=add_result)
+            except Exception as e:
+                add_log("scan error: %s" % e)
+            with lock:
+                acc = sum(1 for r in rows if r["status"].startswith("accessible"))
+                logs.append("--- scan complete: %d/%d shells ---" % (acc, len(rows)))
+            st["scanning"] = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def log_attr(line):
+        low = line.lower()
+        if "accessible" in low or "shells" in low:
+            return GREEN
+        if "timeout" in low or "inaccessible" in low or "silent" in low or "error" in low:
+            return RED
+        if "probing" in low:
+            return curses.A_DIM
+        return 0
+
+    def draw():
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        with lock:
+            snap = list(rows)
+            loglines = list(logs)
+        acc = sum(1 for r in snap if r["status"].startswith("accessible"))
+
+        head = " UART Scanner   %d 8N1   %s" % (
+            baud, "scanning..." if st["scanning"] else "done  %d/%d shells" % (acc, len(snap)))
+        _tui_put(stdscr, 0, 0, head.ljust(w - 1), curses.A_REVERSE | B)
+
+        Lw = max(20, min(34, w // 3))
+        logh = max(5, (h - 7) // 3)
+        mid = h - logh - 2                     # row of the horizontal separator
+        _tui_put(stdscr, 1, 1, "PORTS", curses.A_DIM)
+        _tui_put(stdscr, 1, Lw + 3, "DETAILS", curses.A_DIM)
+
+        # --- port list (left) ---
+        listrows = max(1, mid - 2)
+        if st["sel"] < st["top"]:
+            st["top"] = st["sel"]
+        if st["sel"] >= st["top"] + listrows:
+            st["top"] = st["sel"] - listrows + 1
+        for k in range(listrows):
+            ri = st["top"] + k
+            if ri >= len(snap):
+                break
+            r = snap[ri]
+            y = 2 + k
+            kind = status_kind(r["status"])
+            _tui_put(stdscr, y, 1, "  ", KIND_ATTR[kind] | curses.A_REVERSE)
+            sel = (ri == st["sel"])
+            label = "%-8s %s" % (r["port"], r["status"])
+            _tui_put(stdscr, y, 4, label[:Lw - 4],
+                     curses.A_REVERSE | B if sel else 0)
+
+        try:
+            stdscr.vline(2, Lw + 1, curses.ACS_VLINE, max(1, mid - 2))
+        except curses.error:
+            pass
+
+        # --- details (right) ---
+        if snap:
+            r = snap[min(st["sel"], len(snap) - 1)]
+            x = Lw + 3
+            _tui_put(stdscr, 2, x, "%s  " % r["port"], B)
+            _tui_put(stdscr, 2, x + len(r["port"]) + 2, r["status"],
+                     KIND_ATTR[status_kind(r["status"])])
+            dy = 4
+            for label, val, _codes in _detail_fields(r):
+                _tui_put(stdscr, dy, x, "%-7s: " % label, curses.A_DIM)
+                _tui_put(stdscr, dy, x + 9, (val or "-"), FIELD_ATTR.get(label, 0))
+                dy += 1
+            if not r["info"] and r.get("note"):
+                _tui_put(stdscr, dy + 1, x, "note   : ", curses.A_DIM)
+                _tui_put(stdscr, dy + 1, x + 9, r["note"], curses.A_DIM)
+
+        # --- log (bottom) ---
+        try:
+            stdscr.hline(mid, 0, curses.ACS_HLINE, w)
+        except curses.error:
+            pass
+        tag = " LOG  (PgUp/PgDn scroll%s) " % ("  +%d" % st["log_off"] if st["log_off"] else "")
+        _tui_put(stdscr, mid, 2, tag, B)
+        vis = h - 1 - (mid + 1)
+        total = len(loglines)
+        maxoff = max(0, total - vis)
+        st["log_off"] = min(st["log_off"], maxoff)
+        start = max(0, total - vis - st["log_off"])
+        for i in range(vis):
+            li = start + i
+            if li >= total:
+                break
+            _tui_put(stdscr, mid + 1 + i, 1, loglines[li], log_attr(loglines[li]))
+
+        foot = st["msg"] or " up/down select | Enter open | r rescan | PgUp/PgDn log | q quit "
+        _tui_put(stdscr, h - 1, 0, foot.ljust(w - 1), curses.A_REVERSE)
+        stdscr.refresh()
+
+    start_scan()
+    while True:
+        draw()
+        try:
+            ch = stdscr.getch()
+        except KeyboardInterrupt:
+            break
+        if ch == -1:
+            continue
+        st["msg"] = ""
+        with lock:
+            n = len(rows)
+        if ch in (curses.KEY_UP, ord("k")):
+            st["sel"] = max(0, st["sel"] - 1)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            st["sel"] = min(n - 1, st["sel"] + 1)
+        elif ch == curses.KEY_HOME:
+            st["sel"] = 0
+        elif ch == curses.KEY_END:
+            st["sel"] = n - 1
+        elif ch == curses.KEY_PPAGE:
+            st["log_off"] += 5
+        elif ch == curses.KEY_NPAGE:
+            st["log_off"] = max(0, st["log_off"] - 5)
+        elif ch in (ord("r"), ord("R")):
+            start_scan()
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            with lock:
+                r = rows[st["sel"]] if rows else None
+            if r:
+                msg = open_port(r["port"], baud, opener_exe)
+                add_log(msg)
+                st["msg"] = " " + msg + " "
+        elif ch in (ord("q"), 27):
+            break
+
+
+def run_tui(ports, baud, timeout, workers, verbose, opener_exe):
+    """Run the curses TUI. Returns True if it ran, False to fall back to CLI."""
+    try:
+        import curses  # noqa: F401  (windows-curses on Windows)
+    except Exception as e:
+        hint = "  Install it:  pip install windows-curses" if IS_WIN else ""
+        print(f"[TUI disabled] the 'curses' module is not available ({e}).{hint}")
+        print("Falling back to plain output. Use --no-tui to silence this.\n")
+        return False
+    try:
+        curses.wrapper(lambda scr: _tui_loop(scr, ports, baud, timeout,
+                                             workers, verbose, opener_exe))
+        return True
+    except Exception as e:                     # terminal restored by wrapper
+        print(f"[TUI error] {e}; using plain output.\n")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -906,6 +1154,8 @@ def main():
                     help="path to ttermpro.exe (auto-detected if omitted)")
     ap.add_argument("--no-menu", action="store_true",
                     help="skip the interactive TeraTerm picker after scanning")
+    ap.add_argument("--no-tui", action="store_true",
+                    help="use plain scrolling output instead of the full-screen TUI")
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("--no-resize", action="store_true",
                     help="do not shrink the console window on start")
@@ -933,6 +1183,20 @@ def main():
         return
 
     workers = max(1, min(args.workers, len(ports)))
+
+    # Resolve the "opener" up front (TeraTerm on Windows, a serial tool on Unix).
+    if IS_WIN:
+        opener = args.teraterm or find_teraterm() or DEFAULT_TERATERM
+    else:
+        opener = ""
+
+    # Default experience: the full-screen TUI (unless disabled or non-interactive).
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if interactive and not args.no_tui:
+        if run_tui(ports, args.baud, args.timeout, workers, args.verbose, opener):
+            return
+        # else: TUI unavailable -> fall through to plain output
+
     print(f"Scanning {len(ports)} port(s) at {args.baud} baud "
           f"({workers} in parallel, hard timeout {args.timeout:g}s/port): "
           f"{', '.join(ports)}\n")
@@ -973,20 +1237,18 @@ def main():
             if val:
                 print("      " + paint(f"{label:<6}: ", DIM) + paint(val, *codes))
 
-    # Resolve the "opener": TeraTerm on Windows, a serial tool on Unix.
+    # Opener note for the plain-output picker.
     if IS_WIN:
-        teraterm = args.teraterm or find_teraterm() or DEFAULT_TERATERM
-        opener_note = (f"TeraTerm: {teraterm}"
-                       f"{'' if os.path.isfile(teraterm) else '   (NOT FOUND)'}")
+        opener_note = (f"TeraTerm: {opener}"
+                       f"{'' if os.path.isfile(opener) else '   (NOT FOUND)'}")
     else:
-        teraterm = ""
         tool = next((n for n, _ in _SERIAL_TOOLS if shutil.which(n)), None)
         opener_note = (f"Serial console: {tool}" if tool else
                        "Serial console: none found (install tio/picocom/minicom/screen)")
 
     if not args.no_menu:
         print("\n" + opener_note)
-        interactive_menu(results, args.baud, teraterm)
+        interactive_menu(results, args.baud, opener)
 
 
 if __name__ == "__main__":

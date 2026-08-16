@@ -17,6 +17,7 @@ echo.
 echo Building single-file exe...
 %PY% -m PyInstaller --onefile --console --name uart_scan ^
     --hidden-import serial.tools.list_ports ^
+    --hidden-import curses --hidden-import _curses ^
     uart_scan.py || goto :err
 
 echo.
