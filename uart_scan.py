@@ -42,6 +42,50 @@ except ImportError:
 IS_WIN = os.name == "nt"
 
 
+# ---------------------------------------------------------------------------
+# ANSI color (Linux natively; Windows once VT processing is enabled)
+# ---------------------------------------------------------------------------
+FG_RED, FG_GREEN, FG_YELLOW, FG_BLUE = 31, 32, 33, 34
+FG_MAGENTA, FG_CYAN, FG_GRAY = 35, 36, 90
+BOLD, DIM = 1, 2
+USE_COLOR = False
+
+
+def setup_color():
+    """Enable colored output when the terminal supports it (and NO_COLOR unset)."""
+    global USE_COLOR
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        USE_COLOR = False
+    elif IS_WIN:
+        USE_COLOR = enable_vt()          # defined below; called at runtime
+    else:
+        USE_COLOR = True
+    return USE_COLOR
+
+
+def paint(text, *codes):
+    """Wrap text in SGR color codes when coloring is on; otherwise return as-is."""
+    if not USE_COLOR or not codes:
+        return text
+    return "\x1b[" + ";".join(str(c) for c in codes) + "m" + text + "\x1b[0m"
+
+
+def status_style(status):
+    """SGR codes for a port status (green=shell, red=timeout/fail, yellow=partial)."""
+    s = status.lower()
+    if s.startswith("accessible"):
+        return (FG_GREEN, BOLD)
+    if "timeout" in s:
+        return (FG_RED, BOLD)
+    if s.startswith("inaccessible"):
+        return (FG_RED,)
+    if "login required" in s:
+        return (FG_YELLOW, BOLD)
+    if s.startswith("responded"):
+        return (FG_YELLOW,)
+    return (FG_GRAY,)          # silent / anything else
+
+
 def enumerate_ports(include_all=False):
     """
     List serial ports worth scanning.
@@ -375,14 +419,16 @@ def scan_parallel(ports, baud, verbose, budget, max_workers):
                 results.append(got)
                 job["proc"].join(1)
                 active.remove(job)
-                print(f"    -> {got['port']}: {got['status']}", flush=True)
+                print(f"    -> {paint(got['port'], BOLD)}: "
+                      f"{paint(got['status'], *status_style(got['status']))}", flush=True)
             elif time.time() > job["deadline"]:
                 job["proc"].terminate()         # hard kill, frees the port
                 job["proc"].join(2)
                 res = _timeout_result(job["port"], budget)
                 results.append(res)
                 active.remove(job)
-                print(f"    -> {res['port']}: {res['status']}", flush=True)
+                print(f"    -> {paint(res['port'], BOLD)}: "
+                      f"{paint(res['status'], *status_style(res['status']))}", flush=True)
 
     # Preserve original port order in the summary.
     order = {p: i for i, p in enumerate(ports)}
@@ -662,10 +708,13 @@ _DETAIL_LINES = 3
 
 
 def _detail_block(r, width):
-    """Fixed-height detail panel for the highlighted port."""
+    """Fixed-height detail panel for the highlighted port (colored)."""
     dev = r["type"] if r["type"] not in ("-", "") else (r["note"] or "-")
     lines = _wrap(dev, "  device: ", width, _DETAIL_LINES - 1)
-    lines.append(("  ip     : " + (r.get("ip") or "-"))[:width])
+    lines = [paint(l, FG_CYAN) if l.strip() else l for l in lines]
+    ip = r.get("ip") or "-"
+    ipline = ("  ip     : " + ip)[:width]
+    lines.append(paint(ipline, FG_GREEN) if ip not in ("-", "") else ipline)
     return lines
 
 
@@ -713,14 +762,19 @@ def _menu_arrows(choices, baud, exe):
         first = False
         sys.stdout.write("\x1b[0J")              # erase everything below
 
-        print(header[:width])
+        print(paint(header[:width], BOLD))
         for i, r in enumerate(choices):
-            marker = ">" if i == sel else " "
-            label = _menu_label(r, width)
+            typ_w = max(6, width - 42)
+            port = f"{r['port']:<12}"[:12]
+            stat = f"{r['status']:<24}"[:24]
+            typ = f"{r['type'][:typ_w]:<{typ_w}}"
             if i == sel:
-                print(f" {marker} \x1b[7m{label}\x1b[0m")
+                # reverse-video highlight (no inner color: a reset would end it)
+                print(f" > \x1b[7m{port} {stat} {typ}\x1b[0m")
             else:
-                print(f" {marker} {label}")
+                print("   " + paint(port, BOLD) + " "
+                      + paint(stat, *status_style(r["status"])) + " "
+                      + paint(typ, FG_CYAN))
         print("")
         print(("  " + "-" * (width - 4))[:width])   # separator rule
         for dl in _detail_block(choices[sel], width):
@@ -792,6 +846,7 @@ def main():
 
     if not args.no_resize:
         set_console_size()
+    setup_color()          # enable ANSI colors (also turns on VT on Windows)
 
     if args.ports:
         ports = args.ports
@@ -818,24 +873,33 @@ def main():
     # ---- summary ----  (kept ~96 cols wide so a small console doesn't wrap)
     W = 96
     print("\n" + "=" * W)
-    print("SUMMARY")
+    print(paint("SUMMARY", BOLD))
     print("=" * W)
-    fmt = "{:<13} {:<22} {:<38} {:<20}"
-    print(fmt.format("PORT", "STATUS", "TYPE / DEVICE", "IP (iface:addr)"))
+    print(paint(f"{'PORT':<13} {'STATUS':<22} {'TYPE / DEVICE':<38} "
+                f"{'IP (iface:addr)':<20}", BOLD))
     print("-" * W)
     for r in results:
         typ = r["type"] if r["type"] != "-" else (r["note"] or "-")
-        print(fmt.format(r["port"][:13], r["status"][:22], typ[:38], r["ip"][:20]))
+        has_ip = r["ip"] not in ("-", "")
+        row = (paint(f"{r['port'][:13]:<13}", BOLD) + " "
+               + paint(f"{r['status'][:22]:<22}", *status_style(r["status"])) + " "
+               + paint(f"{typ[:38]:<38}", FG_CYAN) + " "
+               + (paint(f"{r['ip'][:20]:<20}", FG_GREEN) if has_ip
+                  else f"{'-':<20}"))
+        print(row)
     print("=" * W)
 
     accessible = [r for r in results if r["status"].startswith("accessible")]
-    print(f"\n{len(accessible)}/{len(results)} port(s) gave a shell.")
+    n = len(accessible)
+    tail = paint(f"{n}", FG_GREEN, BOLD) if n else paint("0", FG_RED, BOLD)
+    print(f"\n{tail}/{len(results)} port(s) gave a shell.")
 
     # Detail block for anything we got into, so long fields aren't truncated.
     for r in accessible:
-        print(f"\n  {r['port']}  [{r['status']}]")
-        print(f"      device: {r['type']}")
-        print(f"      ip    : {r['ip']}")
+        print(f"\n  {paint(r['port'], BOLD)}  "
+              f"[{paint(r['status'], *status_style(r['status']))}]")
+        print(f"      device: {paint(r['type'], FG_CYAN)}")
+        print(f"      ip    : {paint(r['ip'], FG_GREEN)}")
 
     # Resolve the "opener": TeraTerm on Windows, a serial tool on Unix.
     if IS_WIN:
