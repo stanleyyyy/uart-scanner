@@ -623,8 +623,50 @@ def _getch():
 OPENER = "TeraTerm" if IS_WIN else "a serial console"
 
 
-def _menu_label(r):
-    return f"{r['port']:<12} {r['status']:<24} {r['type'][:32]}"
+def _term_width(default=100):
+    try:
+        return max(40, shutil.get_terminal_size((default, 40)).columns - 1)
+    except Exception:
+        return default
+
+
+def _menu_label(r, width=None):
+    """One compact row: PORT  STATUS  short-type."""
+    label = f"{r['port']:<12} {r['status']:<24} {r['type'][:32]}"
+    if width:
+        label = label[:width - 4]
+    return label
+
+
+def _wrap(text, prefix, width, max_lines):
+    """Wrap `text` under a fixed label prefix into exactly `max_lines` lines."""
+    import textwrap
+    pad = " " * len(prefix)
+    avail = max(8, width - len(prefix))
+    chunks = textwrap.wrap(text, avail) or [""]
+    out = []
+    for i in range(max_lines):
+        head = prefix if i == 0 else pad
+        if i < len(chunks):
+            body = chunks[i]
+            if i == max_lines - 1 and len(chunks) > max_lines:   # ran out of room
+                body = body[:max(1, avail - 3)] + "..."
+            out.append((head + body)[:width])
+        else:
+            out.append("")
+    return out
+
+
+# Lines reserved for the highlighted item's detail panel (device wraps to 2).
+_DETAIL_LINES = 3
+
+
+def _detail_block(r, width):
+    """Fixed-height detail panel for the highlighted port."""
+    dev = r["type"] if r["type"] not in ("-", "") else (r["note"] or "-")
+    lines = _wrap(dev, "  device: ", width, _DETAIL_LINES - 1)
+    lines.append(("  ip     : " + (r.get("ip") or "-"))[:width])
+    return lines
 
 
 def _menu_numbered(choices, baud, exe):
@@ -632,7 +674,11 @@ def _menu_numbered(choices, baud, exe):
     while True:
         print("\nResponding ports:")
         for i, r in enumerate(choices, 1):
-            print(f"  {i}. {_menu_label(r)}")
+            print(f"  {i}. {r['port']:<10} {r['status']}")
+            if r["type"] not in ("-", ""):
+                print(f"       {r['type']}")
+            if r.get("ip", "-") not in ("-", ""):
+                print(f"       ip: {r['ip']}")
         try:
             raw = input(f"Open which in {OPENER}? (number, or q to quit): ").strip()
         except EOFError:
@@ -649,32 +695,37 @@ def _menu_arrows(choices, baud, exe):
     """
     Arrow-key picker with reverse-video highlight (requires VT + msvcrt).
 
-    Draws a fixed-height block and repaints it in place on every keypress, so
-    selecting a port does not scroll a fresh copy down the screen. The launch
-    result is shown on a status line inside the block.
+    Draws a fixed-height block and repaints it in place on every keypress. Under
+    the port list is a detail panel showing the highlighted port's full device
+    string and IP, so long values that don't fit the row are still readable.
     """
     sel = 0
     status = "\u2191/\u2193 move \u00b7 Enter open \u00b7 Esc/q quit"
     header = f"Select a port to open in {OPENER}:"
-    block = len(choices) + 3          # header + rows + blank + status
+    # header + rows + blank + separator + detail lines + status
+    block = 1 + len(choices) + 1 + 1 + _DETAIL_LINES + 1
     first = True
 
     while True:
+        width = _term_width()
         if not first:
             sys.stdout.write(f"\x1b[{block}A")   # jump back to top of block
         first = False
         sys.stdout.write("\x1b[0J")              # erase everything below
 
-        print(header)
+        print(header[:width])
         for i, r in enumerate(choices):
             marker = ">" if i == sel else " "
-            label = _menu_label(r)
+            label = _menu_label(r, width)
             if i == sel:
                 print(f" {marker} \x1b[7m{label}\x1b[0m")
             else:
                 print(f" {marker} {label}")
         print("")
-        print(status)
+        print(("  " + "-" * (width - 4))[:width])   # separator rule
+        for dl in _detail_block(choices[sel], width):
+            print(dl)
+        print(status[:width])
 
         key = _getch()
         if key == "up":
