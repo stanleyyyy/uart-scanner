@@ -1151,12 +1151,12 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
             stdscr.hline(mid, 0, curses.ACS_HLINE, w)
         except curses.error:
             pass
-        tag = " LOG  (PgUp/PgDn scroll%s) " % ("  +%d" % st["log_off"] if st["log_off"] else "")
-        _tui_put(stdscr, mid, 2, tag, B)
         vis = h - 1 - (mid + 1)
         total = len(loglines)
         maxoff = max(0, total - vis)
         st["log_off"] = min(st["log_off"], maxoff)
+        tag = " LOG  (PgUp/PgDn scroll%s) " % ("  +%d" % st["log_off"] if st["log_off"] else "")
+        _tui_put(stdscr, mid, 2, tag, B)
         start = max(0, total - vis - st["log_off"])
         for i in range(vis):
             li = start + i
