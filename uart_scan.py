@@ -926,7 +926,8 @@ def _blank_row(port):
             "info": None, "note": ""}
 
 
-def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe):
+def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
+              auto_detect=False, include_all=False):
     import curses
     import threading
 
@@ -972,18 +973,54 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe):
             if i is not None:
                 rows[i] = r
 
+    def refresh_ports():
+        """Re-enumerate ports; rebuild rows keeping order, log added/removed.
+
+        Only runs when the port list was auto-detected -- an explicit list
+        passed on the command line is left untouched. Caller must hold lock.
+        """
+        nonlocal ports, rows, row_of
+        if not auto_detect:
+            return
+        try:
+            current = enumerate_ports(include_all=include_all)
+        except Exception as e:
+            logs.append("port refresh failed: %s" % e)
+            return
+        old = set(ports)
+        new = set(current)
+        added = [p for p in current if p not in old]
+        removed = [p for p in ports if p not in new]
+        if not added and not removed:
+            return
+        for p in added:
+            logs.append("+++ new port detected: %s" % p)
+        for p in removed:
+            logs.append("--- port removed: %s" % p)
+        ports = list(current)
+        rows = [_blank_row(p) for p in ports]
+        row_of = {p: i for i, p in enumerate(ports)}
+        st["sel"] = min(st["sel"], max(0, len(ports) - 1))
+        st["top"] = 0
+
     def start_scan():
         if st["scanning"]:
             return
         with lock:
+            refresh_ports()
             for i, p in enumerate(ports):
                 rows[i] = _blank_row(p)
-            logs.append("--- scan start (%d ports @ %d baud) ---" % (len(ports), baud))
+            scan_ports = list(ports)
+            logs.append("--- scan start (%d ports @ %d baud) ---" % (len(scan_ports), baud))
+        if not scan_ports:
+            with lock:
+                logs.append("--- no ports to scan ---")
+            return
         st["scanning"] = True
 
         def worker():
             try:
-                scan_parallel(ports, baud, verbose, timeout, workers,
+                scan_parallel(scan_ports, baud, verbose, timeout, workers,
                               on_log=add_log, on_result=add_result)
             except Exception as e:
                 add_log("scan error: %s" % e)
@@ -1080,7 +1117,7 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe):
                 break
             _tui_put(stdscr, mid + 1 + i, 1, loglines[li], log_attr(loglines[li]))
 
-        foot = st["msg"] or " up/down select | Enter open | r rescan | PgUp/PgDn log | q quit "
+        foot = st["msg"] or " up/down select | Enter open | r refresh+rescan | PgUp/PgDn log | q quit "
         _tui_put(stdscr, h - 1, 0, foot.ljust(w - 1), curses.A_REVERSE)
         stdscr.refresh()
 
@@ -1121,7 +1158,8 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe):
             break
 
 
-def run_tui(ports, baud, timeout, workers, verbose, opener_exe):
+def run_tui(ports, baud, timeout, workers, verbose, opener_exe,
+            auto_detect=False, include_all=False):
     """Run the curses TUI. Returns True if it ran, False to fall back to CLI."""
     try:
         import curses  # noqa: F401  (windows-curses on Windows)
@@ -1132,7 +1170,8 @@ def run_tui(ports, baud, timeout, workers, verbose, opener_exe):
         return False
     try:
         curses.wrapper(lambda scr: _tui_loop(scr, ports, baud, timeout,
-                                             workers, verbose, opener_exe))
+                                             workers, verbose, opener_exe,
+                                             auto_detect, include_all))
         return True
     except Exception as e:                     # terminal restored by wrapper
         print(f"[TUI error] {e}; using plain output.\n")
@@ -1169,8 +1208,10 @@ def main():
 
     if args.ports:
         ports = args.ports
+        auto_detect = False
     else:
         ports = enumerate_ports(include_all=args.all)
+        auto_detect = True
 
     if not ports:
         if not IS_WIN and not args.all:
@@ -1193,7 +1234,8 @@ def main():
     # Default experience: the full-screen TUI (unless disabled or non-interactive).
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if interactive and not args.no_tui:
-        if run_tui(ports, args.baud, args.timeout, workers, args.verbose, opener):
+        if run_tui(ports, args.baud, args.timeout, workers, args.verbose, opener,
+                   auto_detect=auto_detect, include_all=args.all):
             return
         # else: TUI unavailable -> fall through to plain output
 
