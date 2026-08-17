@@ -959,7 +959,8 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
     rows = [_blank_row(p) for p in ports]
     row_of = {p: i for i, p in enumerate(ports)}
     logs = []
-    st = {"scanning": False, "sel": 0, "top": 0, "log_off": 0, "msg": ""}
+    st = {"scanning": False, "sel": 0, "top": 0, "log_off": 0, "msg": "",
+          "stop": False}
 
     def add_log(text):
         with lock:
@@ -973,41 +974,87 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
             if i is not None:
                 rows[i] = r
 
-    def refresh_ports():
-        """Re-enumerate ports; rebuild rows keeping order, log added/removed.
+    def scan_ports_bg(targets):
+        """Probe a subset of ports in a background thread.
 
-        Only runs when the port list was auto-detected -- an explicit list
-        passed on the command line is left untouched. Caller must hold lock.
+        Does not touch the global 'scanning' banner -- used for auto-detected
+        new ports so the rest of the app stays responsive. Each port runs in
+        its own process, so this is safe to overlap with any other scan.
+        """
+        targets = list(targets)
+        if not targets:
+            return
+        w = max(1, min(workers, len(targets)))
+
+        def run():
+            try:
+                scan_parallel(targets, baud, verbose, timeout, w,
+                              on_log=add_log, on_result=add_result)
+            except Exception as e:
+                add_log("auto-scan error: %s" % e)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def apply_port_diff(current):
+        """Sync `rows` to the enumerated `current` list. Caller must hold lock.
+
+        Existing rows (and their scan results) are preserved for ports that are
+        still present; removed ports drop out; added ports get a blank row.
+        Returns the list of newly-added ports.
         """
         nonlocal ports, rows, row_of
-        if not auto_detect:
-            return
-        try:
-            current = enumerate_ports(include_all=include_all)
-        except Exception as e:
-            logs.append("port refresh failed: %s" % e)
-            return
         old = set(ports)
         new = set(current)
         added = [p for p in current if p not in old]
         removed = [p for p in ports if p not in new]
         if not added and not removed:
-            return
+            return []
         for p in added:
             logs.append("+++ new port detected: %s" % p)
         for p in removed:
             logs.append("--- port removed: %s" % p)
+        keep = {r["port"]: r for r in rows}
+        sel_port = ports[st["sel"]] if 0 <= st["sel"] < len(ports) else None
         ports = list(current)
-        rows = [_blank_row(p) for p in ports]
+        rows = [keep.get(p) or _blank_row(p) for p in ports]
         row_of = {p: i for i, p in enumerate(ports)}
-        st["sel"] = min(st["sel"], max(0, len(ports) - 1))
-        st["top"] = 0
+        # Keep the cursor on the same port if it still exists.
+        st["sel"] = row_of.get(sel_port, min(st["sel"], max(0, len(ports) - 1)))
+        st["top"] = min(st["top"], max(0, len(ports) - 1))
+        return added
+
+    def poll_ports():
+        """Re-enumerate; apply removals immediately and auto-scan additions.
+
+        Runs in a background thread so a slow enumeration never blocks the UI.
+        Only active when the port list was auto-detected.
+        """
+        while not st["stop"]:
+            time.sleep(1.5)
+            if st["stop"] or not auto_detect:
+                if not auto_detect:
+                    return
+                continue
+            try:
+                current = enumerate_ports(include_all=include_all)
+            except Exception:
+                continue
+            with lock:
+                if set(current) == set(ports):
+                    continue
+                added = apply_port_diff(current)
+            if added:
+                scan_ports_bg(added)
 
     def start_scan():
         if st["scanning"]:
             return
         with lock:
-            refresh_ports()
+            if auto_detect:
+                try:
+                    apply_port_diff(enumerate_ports(include_all=include_all))
+                except Exception as e:
+                    logs.append("port refresh failed: %s" % e)
             for i, p in enumerate(ports):
                 rows[i] = _blank_row(p)
             scan_ports = list(ports)
@@ -1117,45 +1164,52 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
                 break
             _tui_put(stdscr, mid + 1 + i, 1, loglines[li], log_attr(loglines[li]))
 
-        foot = st["msg"] or " up/down select | Enter open | r refresh+rescan | PgUp/PgDn log | q quit "
+        auto = "  auto-detect on" if auto_detect else ""
+        foot = st["msg"] or (" up/down select | Enter open | r rescan all | PgUp/PgDn log | q quit"
+                             + auto + " ")
         _tui_put(stdscr, h - 1, 0, foot.ljust(w - 1), curses.A_REVERSE)
         stdscr.refresh()
 
     start_scan()
-    while True:
-        draw()
-        try:
-            ch = stdscr.getch()
-        except KeyboardInterrupt:
-            break
-        if ch == -1:
-            continue
-        st["msg"] = ""
-        with lock:
-            n = len(rows)
-        if ch in (curses.KEY_UP, ord("k")):
-            st["sel"] = max(0, st["sel"] - 1)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            st["sel"] = min(n - 1, st["sel"] + 1)
-        elif ch == curses.KEY_HOME:
-            st["sel"] = 0
-        elif ch == curses.KEY_END:
-            st["sel"] = n - 1
-        elif ch == curses.KEY_PPAGE:
-            st["log_off"] += 5
-        elif ch == curses.KEY_NPAGE:
-            st["log_off"] = max(0, st["log_off"] - 5)
-        elif ch in (ord("r"), ord("R")):
-            start_scan()
-        elif ch in (curses.KEY_ENTER, 10, 13):
+    if auto_detect:
+        threading.Thread(target=poll_ports, daemon=True).start()
+    try:
+        while True:
+            draw()
+            try:
+                ch = stdscr.getch()
+            except KeyboardInterrupt:
+                break
+            if ch == -1:
+                continue
+            st["msg"] = ""
             with lock:
-                r = rows[st["sel"]] if rows else None
-            if r:
-                msg = open_port(r["port"], baud, opener_exe)
-                add_log(msg)
-                st["msg"] = " " + msg + " "
-        elif ch in (ord("q"), 27):
-            break
+                n = len(rows)
+            if ch in (curses.KEY_UP, ord("k")):
+                st["sel"] = max(0, st["sel"] - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                st["sel"] = min(n - 1, st["sel"] + 1)
+            elif ch == curses.KEY_HOME:
+                st["sel"] = 0
+            elif ch == curses.KEY_END:
+                st["sel"] = n - 1
+            elif ch == curses.KEY_PPAGE:
+                st["log_off"] += 5
+            elif ch == curses.KEY_NPAGE:
+                st["log_off"] = max(0, st["log_off"] - 5)
+            elif ch in (ord("r"), ord("R")):
+                start_scan()
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                with lock:
+                    r = rows[st["sel"]] if rows else None
+                if r:
+                    msg = open_port(r["port"], baud, opener_exe)
+                    add_log(msg)
+                    st["msg"] = " " + msg + " "
+            elif ch in (ord("q"), 27):
+                break
+    finally:
+        st["stop"] = True
 
 
 def run_tui(ports, baud, timeout, workers, verbose, opener_exe,
