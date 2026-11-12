@@ -166,7 +166,7 @@ DEFAULT_BAUD = 115200
 READ_TIMEOUT = 0.4          # per-read timeout (s)
 SETTLE       = 0.4          # wait after writing before reading (s)
 LOGIN_RETRIES = 2           # how many newline pokes to try to raise a prompt
-PORT_TIMEOUT = 8            # hard wall-clock budget per port (s); watchdog aborts
+PORT_TIMEOUT = 16           # hard wall-clock budget per port (s); watchdog aborts
 
 LOGIN_PROMPTS = ("login:", "username:", "user:")
 PASSWORD_PROMPTS = ("password:", "passwd:")
@@ -176,17 +176,45 @@ SHELL_PROMPTS = ("#", "$", "~ #", "/ #", ">", "~]#")   # trailing shell markers
 # ---------------------------------------------------------------------------
 # Low-level serial helpers
 # ---------------------------------------------------------------------------
+# Terminal "where is the cursor?" query (DSR). Login profiles on Yocto/BusyBox
+# send it (via `resize`) to learn the screen size and block until the terminal
+# answers -- swallowing whatever we type meanwhile. A real terminal app replies
+# automatically, so we must too.
+DSR_QUERY = b"\x1b[6n"
+DSR_REPLY = b"\x1b[50;200R"                         # "cursor at row 50, col 200"
+
+
 def drain(ser, seconds=SETTLE):
-    """Read everything available for `seconds`, return decoded text."""
+    """Read everything available for `seconds`, return decoded text.
+
+    Answers terminal cursor-position queries on the fly, like a terminal would.
+    """
     end = time.time() + seconds
     chunks = []
+    tail = b""
     while time.time() < end:
         n = ser.in_waiting
         if n:
-            chunks.append(ser.read(n))
+            data = ser.read(n)
+            chunks.append(data)
+            if DSR_QUERY in tail + data:
+                ser.write(DSR_REPLY)
+                ser.flush()
+            tail = data[-(len(DSR_QUERY) - 1):]
         else:
             time.sleep(0.03)
     return b"".join(chunks).decode("utf-8", "replace")
+
+
+def read_until(ser, done, timeout):
+    """Read until done(text) is true or `timeout` elapses; return the text."""
+    buf = ""
+    end = time.time() + timeout
+    while time.time() < end:
+        buf += drain(ser, 0.15)
+        if done(buf):
+            break
+    return buf
 
 
 def send(ser, text, settle=SETTLE):
@@ -361,17 +389,26 @@ def probe_port(port, baud, verbose=False):
         login_seen = looks_like(banner, LOGIN_PROMPTS) and not is_shell(banner)
 
         # If a login prompt is showing, log in as root with no password.
+        # Wait for the shell (or a password prompt) rather than a fixed delay:
+        # login + profile scripts can take seconds, and input typed before the
+        # shell is up gets flushed by login.
         if login_seen:
-            reply = send(ser, "root", settle=0.8)
+            ser.reset_input_buffer()
+            ser.write(b"root\r\n")
+            ser.flush()
+            reply = read_until(
+                ser, lambda t: is_shell(t) or looks_like(t, PASSWORD_PROMPTS), 4.0)
+            if looks_like(reply, PASSWORD_PROMPTS) and not is_shell(reply):
+                ser.write(b"\r\n")                     # empty password
+                ser.flush()
+                reply += read_until(ser, is_shell, 4.0)
             banner += reply
             if verbose:
-                print(f"--- {port} after 'root' ---\n{reply!r}\n")
-            if looks_like(reply, PASSWORD_PROMPTS):
-                banner += send(ser, "", settle=0.8)   # empty password
+                print(f"--- {port} after login ---\n{reply!r}\n")
 
         # One combined command: is there a shell, and if so, what/where is it?
         info = shell_probe(ser, timeout=3.5)
-        if info is None and not login_seen:
+        if info is None:
             send(ser, "", settle=0.2)                  # nudge, retry once
             info = shell_probe(ser, timeout=2.5)
 
