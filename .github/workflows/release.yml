@@ -25,6 +25,16 @@ jobs:
       - name: Install deps
         run: python -m pip install --upgrade pyserial pyinstaller windows-curses
 
+      # On a tag build, bake the tag into __version__ so the update check in
+      # the released binary compares against the version it shipped as.
+      - name: Stamp version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            sed -i "s/^__version__ = .*/__version__ = \"${GITHUB_REF_NAME#v}\"/" uart_scan.py
+          fi
+          echo "APP_VERSION=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' uart_scan.py)" >> "$GITHUB_ENV"
+
       - name: Build exe
         run: >
           pyinstaller --onefile --console --name uart_scan
@@ -32,7 +42,7 @@ jobs:
           --hidden-import curses --hidden-import _curses uart_scan.py
 
       - name: Build installer (Inno Setup)
-        run: iscc installer\uart-scanner.iss
+        run: iscc "/DAppVersion=$env:APP_VERSION" installer\uart-scanner.iss
         # Inno Setup ships preinstalled on GitHub's windows-latest runners.
 
       - name: Stage artifacts
@@ -59,6 +69,10 @@ jobs:
 
       - name: Install deps
         run: python -m pip install --upgrade pyserial pyinstaller
+
+      - name: Stamp version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: sed -i "s/^__version__ = .*/__version__ = \"${GITHUB_REF_NAME#v}\"/" uart_scan.py
 
       - name: Build binary
         run: >

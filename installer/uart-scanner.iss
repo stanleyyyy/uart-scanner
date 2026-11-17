@@ -10,7 +10,10 @@
 ; ===========================================================================
 
 #define AppName    "UART Scanner"
-#define AppVersion "1.0.0"
+; CI passes /DAppVersion=<tag version>; this is the local-build fallback.
+#ifndef AppVersion
+  #define AppVersion "1.2.1"
+#endif
 #define AppExe     "uart_scan.exe"
 
 [Setup]

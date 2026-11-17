@@ -142,7 +142,26 @@ Options:
   --no-menu       Skip the interactive TeraTerm picker
   --no-resize     Don't shrink the console window on start
   --verbose, -v   Dump raw serial dialogue (for tuning prompt detection)
+  --update        Install the latest GitHub release (if newer) and exit
+  --no-update-check  Don't check GitHub for a newer release on start
+  --version       Print the version and exit
 ```
+
+### Updates
+
+On start the scanner asks GitHub for the latest release in the background (it
+never delays the scan, and a failed check is silent). When a newer version
+exists, the TUI logs it and shows it in the header — press **u** to install —
+and plain output prints a notice after the summary.
+
+The release binaries (`uart_scan-windows-x64.exe`, `uart_scan-linux-x64`, and
+the exe the installer puts in place) update themselves in place: the new
+binary is downloaded next to the old one, checked against the release's
+SHA-256 digest, and swapped in; restart to use it. You can also run
+`uart_scan --update` at any time. When running from source, the notice tells
+you to `git pull` instead.
+
+Disable the check with `--no-update-check` or `UART_SCAN_NO_UPDATE_CHECK=1`.
 
 Examples:
 
@@ -210,6 +229,11 @@ Cut a release:
 git tag v1.0.0
 git push origin v1.0.0
 ```
+
+The workflow stamps the tag into `__version__` (and the installer's version)
+before building, so released binaries know which version they are and the
+update check compares against it. Keep `__version__` in `uart_scan.py` roughly
+in step with the latest tag so source runs report something sensible.
 
 ## How it works (notes)
 

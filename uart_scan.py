@@ -41,6 +41,11 @@ except ImportError:
 
 IS_WIN = os.name == "nt"
 
+# Release version. CI stamps this from the pushed tag (vX.Y.Z) before building,
+# so release binaries always report the version they were published as.
+__version__ = "1.2.1"
+UPDATE_REPO = "stanleyyyy/uart-scanner"     # GitHub owner/repo to check for releases
+
 
 # ---------------------------------------------------------------------------
 # ANSI color + glyphs (Linux natively; Windows once VT processing is enabled).
@@ -964,7 +969,7 @@ def _blank_row(port):
 
 
 def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
-              auto_detect=False, include_all=False):
+              auto_detect=False, include_all=False, check_updates=True):
     import curses
     import threading
 
@@ -997,7 +1002,7 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
     row_of = {p: i for i, p in enumerate(ports)}
     logs = []
     st = {"scanning": False, "sel": 0, "top": 0, "log_off": 0, "msg": "",
-          "stop": False}
+          "stop": False, "update": None, "updating": False}
 
     def add_log(text):
         with lock:
@@ -1115,8 +1120,33 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_update(rel):
+        st["update"] = rel
+        add_log("*** " + update_hint(rel, tui=True))
+
+    def install_update():
+        rel = st["update"]
+        if not rel:
+            st["msg"] = " no update available (v%s) " % __version__
+            return
+        if not can_self_update():
+            st["msg"] = " running from source -- update with: git pull "
+            return
+        if st["updating"]:
+            return
+        st["updating"] = True
+
+        def run():
+            if self_update(rel, log=add_log):
+                st["update"] = None
+            st["updating"] = False
+
+        threading.Thread(target=run, daemon=True).start()
+
     def log_attr(line):
         low = line.lower()
+        if line.startswith("***") or "update" in low:
+            return YELLOW | B
         if "accessible" in low or "shells" in low:
             return GREEN
         if "timeout" in low or "inaccessible" in low or "silent" in low or "error" in low:
@@ -1133,8 +1163,11 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
             loglines = list(logs)
         acc = sum(1 for r in snap if r["status"].startswith("accessible"))
 
-        head = " UART Scanner   %d 8N1   %s" % (
-            baud, "scanning..." if st["scanning"] else "done  %d/%d shells" % (acc, len(snap)))
+        head = " UART Scanner v%s   %d 8N1   %s" % (
+            __version__, baud,
+            "scanning..." if st["scanning"] else "done  %d/%d shells" % (acc, len(snap)))
+        if st["update"]:
+            head += "   [update %s available - u]" % st["update"]["tag"]
         _tui_put(stdscr, 0, 0, head.ljust(w - 1), curses.A_REVERSE | B)
 
         Lw = max(20, min(34, w // 3))
@@ -1202,14 +1235,17 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
             _tui_put(stdscr, mid + 1 + i, 1, loglines[li], log_attr(loglines[li]))
 
         auto = "  auto-detect on" if auto_detect else ""
-        foot = st["msg"] or (" up/down select | Enter open | r rescan all | PgUp/PgDn log | q quit"
-                             + auto + " ")
+        upd = " | u update" if st["update"] else ""
+        foot = st["msg"] or (" up/down select | Enter open | r rescan all | PgUp/PgDn log"
+                             + upd + " | q quit" + auto + " ")
         _tui_put(stdscr, h - 1, 0, foot.ljust(w - 1), curses.A_REVERSE)
         stdscr.refresh()
 
     start_scan()
     if auto_detect:
         threading.Thread(target=poll_ports, daemon=True).start()
+    if check_updates:
+        start_update_check(on_update)
     try:
         while True:
             draw()
@@ -1236,6 +1272,8 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
                 st["log_off"] = max(0, st["log_off"] - 5)
             elif ch in (ord("r"), ord("R")):
                 start_scan()
+            elif ch in (ord("u"), ord("U")):
+                install_update()
             elif ch in (curses.KEY_ENTER, 10, 13):
                 with lock:
                     r = rows[st["sel"]] if rows else None
@@ -1250,7 +1288,7 @@ def _tui_loop(stdscr, ports, baud, timeout, workers, verbose, opener_exe,
 
 
 def run_tui(ports, baud, timeout, workers, verbose, opener_exe,
-            auto_detect=False, include_all=False):
+            auto_detect=False, include_all=False, check_updates=True):
     """Run the curses TUI. Returns True if it ran, False to fall back to CLI."""
     try:
         import curses  # noqa: F401  (windows-curses on Windows)
@@ -1262,11 +1300,178 @@ def run_tui(ports, baud, timeout, workers, verbose, opener_exe,
     try:
         curses.wrapper(lambda scr: _tui_loop(scr, ports, baud, timeout,
                                              workers, verbose, opener_exe,
-                                             auto_detect, include_all))
+                                             auto_detect, include_all,
+                                             check_updates))
         return True
     except Exception as e:                     # terminal restored by wrapper
         print(f"[TUI error] {e}; using plain output.\n")
         return False
+
+
+# ---------------------------------------------------------------------------
+# Self-update from GitHub Releases
+# ---------------------------------------------------------------------------
+# Release asset that replaces the running binary, per platform (see release.yml).
+_UPDATE_ASSETS = {"win32": "uart_scan-windows-x64.exe", "linux": "uart_scan-linux-x64"}
+
+
+def _parse_version(text):
+    """'v1.2.10' -> (1, 2, 10); None if it isn't a plain dotted version."""
+    m = re.match(r"^v?(\d+(?:\.\d+)*)$", (text or "").strip())
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def _http_get(url, timeout, accept=None):
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "uart-scanner/%s" % __version__,
+        "Accept": accept or "application/octet-stream"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def update_asset_name():
+    return _UPDATE_ASSETS.get(sys.platform)
+
+
+def can_self_update():
+    """Only a frozen (PyInstaller) build can swap its own binary in place."""
+    return bool(getattr(sys, "frozen", False) and update_asset_name())
+
+
+def check_latest_release(timeout=4.0):
+    """Ask GitHub for the latest (non-draft, non-prerelease) release.
+
+    Returns a dict describing it, with 'newer' set when it beats __version__.
+    Raises on network/API errors so callers can decide how loud to be.
+    """
+    import json
+    url = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+    with _http_get(url, timeout, accept="application/vnd.github+json") as resp:
+        data = json.load(resp)
+    tag = data.get("tag_name", "")
+    latest, current = _parse_version(tag), _parse_version(__version__)
+    want = update_asset_name()
+    asset = next((a for a in data.get("assets") or [] if a.get("name") == want), None)
+    return {
+        "tag": tag,
+        "version": tag.lstrip("v"),
+        "newer": bool(latest and current and latest > current),
+        "page": data.get("html_url", ""),
+        "asset_url": asset.get("browser_download_url") if asset else None,
+        "digest": (asset or {}).get("digest") or "",     # "sha256:<hex>" when present
+    }
+
+
+def self_update(rel, log=print):
+    """Download the release binary and swap it in for the running one.
+
+    The new binary is written next to the current one and moved into place.
+    Windows can't overwrite a running exe but can rename it, so the old one is
+    parked as '<exe>.old' and removed on the next start. Returns True on success.
+    """
+    import hashlib
+    if not can_self_update():
+        log("self-update only works for the release binaries; "
+            "from source, run: git pull")
+        return False
+    if not rel.get("asset_url"):
+        log("release %s has no %s asset; download it manually: %s"
+            % (rel["tag"], update_asset_name(), rel["page"]))
+        return False
+
+    exe = os.path.realpath(sys.executable)
+    new, old = exe + ".new", exe + ".old"
+    log("downloading %s %s ..." % (update_asset_name(), rel["tag"]))
+    try:
+        h = hashlib.sha256()
+        with _http_get(rel["asset_url"], timeout=30) as resp, open(new, "wb") as f:
+            for chunk in iter(lambda: resp.read(1 << 16), b""):
+                h.update(chunk)
+                f.write(chunk)
+        algo, _, want = rel["digest"].partition(":")
+        if algo == "sha256" and want and h.hexdigest() != want.lower():
+            raise ValueError("checksum mismatch (got sha256:%s)" % h.hexdigest())
+        if os.path.getsize(new) < 1 << 20:
+            raise ValueError("download is suspiciously small")
+        os.chmod(new, os.stat(exe).st_mode | 0o111)
+        if IS_WIN:
+            if os.path.exists(old):
+                os.remove(old)
+            os.replace(exe, old)
+            try:
+                os.replace(new, exe)
+            except OSError:
+                os.replace(old, exe)            # put the original back
+                raise
+        else:
+            os.replace(new, exe)
+    except Exception as e:
+        try:
+            os.remove(new)
+        except OSError:
+            pass
+        log("update failed: %s" % e)
+        return False
+    log("updated to %s -- restart uart_scan to use it" % rel["tag"])
+    return True
+
+
+def cleanup_old_binary():
+    """Remove the '<exe>.old' left behind by a previous Windows self-update."""
+    if getattr(sys, "frozen", False):
+        try:
+            os.remove(os.path.realpath(sys.executable) + ".old")
+        except OSError:
+            pass
+
+
+def update_hint(rel, tui=False):
+    """One-line 'update available' notice for a newer release."""
+    if not can_self_update():
+        how = "run: git pull"
+    else:
+        how = "press u to install" if tui else "run: uart_scan --update"
+    return "update available: %s (you have v%s) -- %s" % (rel["tag"], __version__, how)
+
+
+def update_check_enabled(args):
+    return not (args.no_update_check or os.environ.get("UART_SCAN_NO_UPDATE_CHECK"))
+
+
+def start_update_check(on_newer):
+    """Check for a newer release in a background thread; never blocks startup.
+
+    Calls on_newer(release) only if one is found; network errors are ignored.
+    Returns the thread so plain-output mode can wait briefly for it.
+    """
+    import threading
+
+    def run():
+        try:
+            rel = check_latest_release()
+        except Exception:
+            return
+        if rel["newer"]:
+            on_newer(rel)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
+def run_update_command():
+    """--update: check now, install if newer, report. Returns an exit code."""
+    print("uart_scan v%s -- checking %s for updates..." % (__version__, UPDATE_REPO))
+    try:
+        rel = check_latest_release(timeout=10)
+    except Exception as e:
+        print("update check failed: %s" % e)
+        return 1
+    if not rel["newer"]:
+        print("already up to date (latest release: %s)" % (rel["tag"] or "none"))
+        return 0
+    print("new release: %s  %s" % (rel["tag"], rel["page"]))
+    return 0 if self_update(rel) else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1291,7 +1496,18 @@ def main():
                     help="do not shrink the console window on start")
     ap.add_argument("--all", action="store_true",
                     help="scan every port incl. phantom /dev/ttyS* (Linux)")
+    ap.add_argument("--update", action="store_true",
+                    help="install the latest GitHub release (if newer) and exit")
+    ap.add_argument("--no-update-check", action="store_true",
+                    help="don't check GitHub for a newer release on start "
+                         "(or set UART_SCAN_NO_UPDATE_CHECK=1)")
+    ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
     args = ap.parse_args()
+
+    cleanup_old_binary()
+    if args.update:
+        sys.exit(run_update_command())
+    check_updates = update_check_enabled(args)
 
     if not args.no_resize:
         set_console_size()
@@ -1326,9 +1542,14 @@ def main():
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if interactive and not args.no_tui:
         if run_tui(ports, args.baud, args.timeout, workers, args.verbose, opener,
-                   auto_detect=auto_detect, include_all=args.all):
+                   auto_detect=auto_detect, include_all=args.all,
+                   check_updates=check_updates):
             return
         # else: TUI unavailable -> fall through to plain output
+
+    # Runs alongside the scan; the notice is printed after the summary.
+    newer = []
+    update_thread = start_update_check(newer.append) if check_updates else None
 
     print(f"Scanning {len(ports)} port(s) at {args.baud} baud "
           f"({workers} in parallel, hard timeout {args.timeout:g}s/port): "
@@ -1369,6 +1590,11 @@ def main():
         for label, val, codes in _detail_fields(r):
             if val:
                 print("      " + paint(f"{label:<6}: ", DIM) + paint(val, *codes))
+
+    if update_thread:
+        update_thread.join(timeout=2)
+        if newer:
+            print("\n  " + paint(update_hint(newer[0]), FG_YELLOW, BOLD))
 
     # Opener note for the plain-output picker.
     if IS_WIN:
